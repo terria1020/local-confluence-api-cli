@@ -511,7 +511,8 @@ async function uploadAttachment(client, pageId, filePath) {
   const token = process.env.CONFLUENCE_API_TOKEN;
   const baseAuth = Buffer.from(`${email}:${token}`).toString('base64');
 
-  const url = `https://${domain}/wiki/api/v2/pages/${pageId}/attachments`;
+  // v2 API는 attachment POST 미지원 → v1 endpoint 사용
+  const url = `https://${domain}/wiki/rest/api/content/${pageId}/child/attachment`;
   const res = await fetch(url, {
     method: 'POST',
     headers: {
