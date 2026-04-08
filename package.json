@@ -1,0 +1,27 @@
+{
+  "name": "local-confluence-api-cli",
+  "version": "1.0.0",
+  "description": "Confluence API CLI tool for managing pages, attachments, and metadata — designed for safe AI model use via environment-based credential management",
+  "main": "confluence-api-cli.js",
+  "bin": {
+    "confluence-api-cli": "./confluence-api-cli.js"
+  },
+  "scripts": {
+    "help": "node confluence-api-cli.js --help"
+  },
+  "keywords": [
+    "confluence",
+    "atlassian",
+    "api",
+    "cli"
+  ],
+  "author": "",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "dependencies": {
+    "dotenv": "^16.0.0",
+    "winston": "^3.19.0"
+  }
+}
