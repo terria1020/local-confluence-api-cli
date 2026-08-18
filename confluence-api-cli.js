@@ -8,30 +8,13 @@
  * - Metadata management: labels, properties, versions, comments
  * - Attachment management: upload, list, delete, download
  *
- * Credentials are managed via environment variables:
- *   CONFLUENCE_DOMAIN       - e.g. yourcompany.atlassian.net
- *   CONFLUENCE_CONTEXT_PATH - e.g. /wiki or /confluence
- *   CONFLUENCE_BASE_URL     - full base URL override
- *   CONFLUENCE_EMAIL        - Atlassian account email (cloud basic auth)
- *   CONFLUENCE_USERNAME     - username (server basic auth)
- *   CONFLUENCE_API_TOKEN    - API token (cloud basic auth)
- *   CONFLUENCE_SECRET       - password / PAT / bearer token
- *   CONFLUENCE_AUTH_TYPE    - basic | bearer (default: basic)
- *     basic  = CONFLUENCE_EMAIL/CONFLUENCE_USERNAME + CONFLUENCE_API_TOKEN/CONFLUENCE_SECRET
- *              를 "Authorization: Basic <base64>"로 전송. Cloud API 토큰,
- *              Server/DC 계정 비밀번호나 PAT를 그대로 쓸 때 선택.
- *     bearer = CONFLUENCE_SECRET 하나만 "Authorization: Bearer <token>"으로 전송.
- *              Cloud OAuth access token이나 Server/DC PAT를 Bearer 헤더로 보낼 때 선택.
- *              이메일/유저명은 필요 없음.
- *   CONFLUENCE_PLATFORM     - cloud | server (선택, 미지정 시 도메인으로 자동 판별:
- *                             *.atlassian.net이면 cloud, 그 외는 server)
- *   CONFLUENCE_API_VERSION  - v1 | v2 (선택, 미지정 시 platform에 따라 자동 결정:
- *                             cloud는 v2, server는 v1)
+ * Credentials are managed in credentials.json beside this script.
+ * Select a configured site with --site / -s. Tokens and secrets must be Base64 encoded.
  *
  * Usage:
  *   node confluence-api-cli.js --help
- *   node confluence-api-cli.js --get-page <page-id>
- *   node confluence-api-cli.js --create-page --title "제목" --space-id "~12345" --body "<p>내용</p>"
+ *   node confluence-api-cli.js --site my-cloud --get-page <page-id>
+ *   node confluence-api-cli.js --site my-cloud --create-page --title "제목" --space-id "~12345" --body "<p>내용</p>"
  */
 
 'use strict';
@@ -40,10 +23,10 @@ const fs = require('fs');
 const path = require('path');
 const winston = require('winston');
 
-require('dotenv').config({ path: path.resolve(process.cwd(), '.env') });
-
 // ─── Constants ────────────────────────────────────────────────────────────────
 
+const SCRIPT_DIR = __dirname;
+const CREDENTIALS_PATH = path.join(SCRIPT_DIR, 'credentials.json');
 const LOG_DIR = path.join(process.cwd(), 'logs');
 fs.mkdirSync(LOG_DIR, { recursive: true });
 
@@ -107,30 +90,86 @@ function die(msg) {
   throw CLI_EXIT;
 }
 
+function decodeBase64(value) {
+  if (!value) return '';
+  if (typeof value !== 'string' || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value)) {
+    die('site.apiToken or site.secret must be a valid Base64 string.');
+  }
+  try {
+    return Buffer.from(value, 'base64').toString('utf8');
+  } catch (_) {
+    die('Failed to decode Base64 value in credentials.');
+  }
+}
+
+function loadCredentials(credentialsPath) {
+  const resolvedPath = credentialsPath || CREDENTIALS_PATH;
+  if (!fs.existsSync(resolvedPath)) {
+    die(
+      `credentials.json not found at: ${resolvedPath}\n` +
+      '  Copy credentials.example.json to credentials.json and fill values.'
+    );
+  }
+
+  let data;
+  try {
+    data = JSON.parse(fs.readFileSync(resolvedPath, 'utf8'));
+  } catch (err) {
+    die(`Cannot read valid JSON from credential file: ${err.message}`);
+  }
+
+  if (!Array.isArray(data.sites)) {
+    die('credentials.json must have a "sites" array.');
+  }
+  return data;
+}
+
+function getSite(data, id) {
+  const site = data.sites.find((candidate) => candidate.id === id);
+  if (!site) {
+    const ids = data.sites.map((candidate) => candidate.id).join(', ');
+    die(`Site "${id}" not found.\n  Available: ${ids || '(none)'}`);
+  }
+  return site;
+}
+
+function printSiteList(data) {
+  const sites = data.sites.map((site) => ({
+    id: site.id,
+    name: site.name || '',
+    domain: site.domain || site.baseUrl || '',
+    platform: site.platform || '',
+    authType: site.authType || 'basic',
+    note: site.note || '',
+  }));
+  console.log(JSON.stringify(sites, null, 2));
+}
+
 // ─── Confluence Client ────────────────────────────────────────────────────────
 
-function initClient() {
-  const domain = process.env.CONFLUENCE_DOMAIN;
-  const platform = process.env.CONFLUENCE_PLATFORM
-    ? normalizePlatform(process.env.CONFLUENCE_PLATFORM)
-    : inferPlatform(process.env.CONFLUENCE_BASE_URL, domain);
+function initClient(siteId, credentialsPath) {
+  const site = getSite(loadCredentials(credentialsPath), siteId);
+  const domain = site.domain;
+  const platform = site.platform
+    ? normalizePlatform(site.platform)
+    : inferPlatform(site.baseUrl, domain);
   const contextPath = normalizeContextPath(
-    process.env.CONFLUENCE_CONTEXT_PATH || (platform === 'cloud' ? '/wiki' : '')
+    site.contextPath || (platform === 'cloud' ? '/wiki' : '')
   );
-  const baseUrl = process.env.CONFLUENCE_BASE_URL || (domain ? `https://${domain}${contextPath}` : null);
-  const username = process.env.CONFLUENCE_USERNAME || process.env.CONFLUENCE_EMAIL;
-  const secret = process.env.CONFLUENCE_SECRET || process.env.CONFLUENCE_API_TOKEN;
-  const defaultAuthType = normalizeAuthType(process.env.CONFLUENCE_AUTH_TYPE || 'basic');
-  const v1AuthType = normalizeAuthType(process.env.CONFLUENCE_V1_AUTH_TYPE || defaultAuthType);
-  const v2AuthType = normalizeAuthType(process.env.CONFLUENCE_V2_AUTH_TYPE || defaultAuthType);
+  const baseUrl = site.baseUrl || (domain ? `https://${domain}${contextPath}` : null);
+  const username = site.username || site.email;
+  const secret = decodeBase64(site.secret || site.apiToken);
+  const defaultAuthType = normalizeAuthType(site.authType || 'basic');
+  const v1AuthType = normalizeAuthType(site.v1AuthType || defaultAuthType);
+  const v2AuthType = normalizeAuthType(site.v2AuthType || defaultAuthType);
   const defaultApiVersion = normalizeApiVersion(
-    process.env.CONFLUENCE_API_VERSION || (platform === 'server' ? 'v1' : 'v2')
+    site.apiVersion || (platform === 'server' ? 'v1' : 'v2')
   );
 
-  if (!baseUrl) die('CONFLUENCE_BASE_URL or CONFLUENCE_DOMAIN environment variable not set.');
-  if (!secret) die('CONFLUENCE_SECRET or CONFLUENCE_API_TOKEN environment variable not set.');
+  if (!baseUrl) die('site.baseUrl or site.domain is required.');
+  if (!secret) die('site.secret or site.apiToken is required and must be Base64 encoded.');
   if (defaultAuthType === 'basic' && !username) {
-    die('CONFLUENCE_USERNAME or CONFLUENCE_EMAIL environment variable not set.');
+    die('Basic auth requires site.username or site.email.');
   }
 
   const baseAuth = username ? Buffer.from(`${username}:${secret}`).toString('base64') : null;
@@ -145,7 +184,7 @@ function initClient() {
   function authHeaderFor(apiVersion) {
     const authType = authTypeFor(apiVersion);
     if (authType === 'bearer') return `Bearer ${secret}`;
-    if (!baseAuth) die('Basic auth requires CONFLUENCE_USERNAME/CONFLUENCE_EMAIL plus CONFLUENCE_SECRET/CONFLUENCE_API_TOKEN.');
+    if (!baseAuth) die('Basic auth requires site.username/site.email plus site.secret/site.apiToken.');
     return `Basic ${baseAuth}`;
   }
 
@@ -291,7 +330,7 @@ function normalizeAuthType(value) {
   const normalized = String(value || '').trim().toLowerCase();
   if (!normalized) return 'basic';
   if (normalized === 'basic' || normalized === 'bearer') return normalized;
-  die(`CONFLUENCE_AUTH_TYPE must be either "basic" or "bearer" (got "${value}")`);
+  die(`site.authType must be either "basic" or "bearer" (got "${value}")`);
 }
 
 function inferPlatform(baseUrlOverride, domain) {
@@ -302,7 +341,7 @@ function inferPlatform(baseUrlOverride, domain) {
     host = domain || '';
   }
   const platform = /(^|\.)atlassian\.net$/i.test(host) ? 'cloud' : 'server';
-  logger.debug(`CONFLUENCE_PLATFORM not set, inferred "${platform}" from host: ${host}`);
+  logger.debug(`site.platform not set, inferred "${platform}" from host: ${host}`);
   return platform;
 }
 
@@ -312,7 +351,7 @@ function normalizePlatform(value) {
   if (normalized === 'server' || normalized === 'dc' || normalized === 'datacenter' || normalized === 'data-center' || normalized === 'onprem' || normalized === 'on-prem') {
     return 'server';
   }
-  die(`CONFLUENCE_PLATFORM must be either "cloud" or "server" (got "${value}")`);
+  die(`site.platform must be either "cloud" or "server" (got "${value}")`);
 }
 
 function normalizeContextPath(value) {
@@ -326,7 +365,7 @@ function normalizeApiVersion(value) {
   const normalized = String(value || '').trim().toLowerCase();
   if (!normalized) return 'v2';
   if (normalized === 'v1' || normalized === 'v2') return normalized;
-  die(`CONFLUENCE_API_VERSION must be either "v1" or "v2" (got "${value}")`);
+  die(`site.apiVersion must be either "v1" or "v2" (got "${value}")`);
 }
 
 function parseJsonOption(jsonString, optionName) {
@@ -870,71 +909,77 @@ Usage: confluence-api-cli [command] [options]
 
 ─── Examples ─────────────────────────────────────────────────────────────────
 
-  node confluence-api-cli.js --get-page 123456789
-  node confluence-api-cli.js --list-pages --space-id "~12345" --limit 10
-  node confluence-api-cli.js --create-page --title "신규 페이지" --space-id "~12345" --body "<p>내용</p>"
-  node confluence-api-cli.js --create-page --title "하위 페이지" --space-id "~12345" --parent-id 123456789 --body "<p>내용</p>"
-  node confluence-api-cli.js --update-page 123456789 --title "수정된 제목" --body "<p>수정된 내용</p>"
-  node confluence-api-cli.js --delete-page 123456789
-  node confluence-api-cli.js --get-children 123456789 --limit 20
-  node confluence-api-cli.js --search --cql "type=page AND title~\"배포\"" --limit 10
+  node confluence-api-cli.js --list-sites
+  node confluence-api-cli.js --site my-cloud --get-page 123456789
+  node confluence-api-cli.js --site my-server --list-pages --space-id "~12345" --limit 10
+  node confluence-api-cli.js --site my-cloud --create-page --title "신규 페이지" --space-id "~12345" --body "<p>내용</p>"
 
-  node confluence-api-cli.js --list-labels 123456789
-  node confluence-api-cli.js --add-labels 123456789 --labels "bug,urgent"
-  node confluence-api-cli.js --remove-label 123456789 --label "bug"
-  node confluence-api-cli.js --list-properties 123456789
-  node confluence-api-cli.js --set-property 123456789 --key "status" --value "done"
-  node confluence-api-cli.js --set-property 123456789 --key "meta" --value '{"env":"prod","version":2}'
-  node confluence-api-cli.js --delete-property 123456789 --key "status"
-  node confluence-api-cli.js --list-versions 123456789 --limit 5
-  node confluence-api-cli.js --list-comments 123456789
-  node confluence-api-cli.js --add-comment 123456789 --body "<p>확인 부탁드립니다.</p>"
+─── Credentials ──────────────────────────────────────────────────────────────
 
-  node confluence-api-cli.js --list-attachments 123456789
-  node confluence-api-cli.js --upload-attachment 123456789 --file ./report.pdf
-  node confluence-api-cli.js --delete-attachment att-abc123
-  node confluence-api-cli.js --download-attachment att-abc123 --output ./downloaded.pdf
+  -s, --site <id>                 credentials.json의 site ID (명령 실행 시 필수)
+  --credentials-path <path>       자격증명 파일 경로 (기본: 스크립트 옆 credentials.json)
+  --list-sites                    비밀값을 제외한 사용 가능한 site 목록 출력
 
-─── Environment ──────────────────────────────────────────────────────────────
-
-  CONFLUENCE_DOMAIN       Atlassian 도메인
-  CONFLUENCE_CONTEXT_PATH /wiki, /confluence 등 컨텍스트 경로
-  CONFLUENCE_BASE_URL     전체 base URL 오버라이드
-  CONFLUENCE_EMAIL        Cloud basic auth 계정 이메일
-  CONFLUENCE_USERNAME     Server basic auth 사용자명
-  CONFLUENCE_API_TOKEN    Cloud API 토큰
-  CONFLUENCE_SECRET       Server PAT / 비밀번호 / bearer 토큰
-  CONFLUENCE_AUTH_TYPE    basic | bearer (기본: basic)
-                          basic  = 이메일/유저명 + API 토큰(PAT)을 Basic 인증으로 전송
-                          bearer = CONFLUENCE_SECRET(OAuth 액세스 토큰, Server PAT 등)만
-                                   Bearer 헤더로 전송 — 이메일/유저명 불필요
-  CONFLUENCE_PLATFORM     cloud | server (선택 — 미지정 시 도메인으로 자동 판별:
-                          *.atlassian.net → cloud, 그 외 → server)
-  CONFLUENCE_API_VERSION  v1 | v2 (선택 — 미지정 시 platform 기준 자동 결정:
-                          cloud → v2, server → v1)
-  LOG_LEVEL               로그 레벨 (기본: info)
+  credentials.json의 apiToken 또는 secret은 Base64 인코딩해야 합니다.
+  예: echo -n 'TOKEN' | base64
 
 ─── Setup ────────────────────────────────────────────────────────────────────
 
-  1. .env.example 을 .env 로 복사
-  2. base URL과 auth 타입에 맞는 변수 설정 (platform/API 버전은 보통 자동 판별됨)
-  3. CLI 실행
+  1. credentials.example.json을 credentials.json으로 복사
+  2. site 설정과 Base64 인코딩한 토큰/비밀값 입력
+  3. --site <id>를 지정하여 CLI 실행
 `);
 }
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
-async function main() {
-  const args = process.argv.slice(2);
+function parseGlobalOptions(argv) {
+  const options = {
+    siteId: null,
+    credentialsPath: null,
+    listSites: false,
+    commandArgs: [],
+  };
 
-  if (args.length === 0 || args.includes('--help') || args.includes('-h')) {
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg === '--site' || arg === '-s') {
+      if (!argv[i + 1]) die(`${arg} requires a site ID`);
+      options.siteId = argv[++i];
+    } else if (arg === '--credentials-path') {
+      if (!argv[i + 1]) die('--credentials-path requires a path');
+      options.credentialsPath = argv[++i];
+    } else if (arg === '--list-sites') {
+      options.listSites = true;
+    } else {
+      options.commandArgs.push(arg);
+    }
+  }
+  return options;
+}
+
+async function main() {
+  const rawArgs = process.argv.slice(2);
+
+  if (rawArgs.length === 0 || rawArgs.includes('--help') || rawArgs.includes('-h')) {
     printHelp();
     exitCli(0);
     return;
   }
 
   try {
-    const client = initClient();
+    const options = parseGlobalOptions(rawArgs);
+    if (options.listSites) {
+      if (options.commandArgs.length > 0) die('--list-sites must be used without another command.');
+      printSiteList(loadCredentials(options.credentialsPath));
+      exitCli(0);
+      return;
+    }
+    if (!options.siteId) die('Missing -s / --site. Specify a site ID.');
+
+    const args = options.commandArgs;
+    if (args.length === 0) die('Missing command. Run with --help to see available commands.');
+    const client = initClient(options.siteId, options.credentialsPath);
     const cmd = args[0];
 
     // ── Content Management ──────────────────────────────────────────────────
