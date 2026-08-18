@@ -1,6 +1,6 @@
 # local-confluence-api-cli
 
-Atlassian Confluence Cloud REST API를 사용하는 CLI 도구입니다.
+Atlassian Confluence Cloud 및 Server/Data Center REST API를 사용하는 CLI 도구입니다.
 페이지 생성/수정, 라벨·프로퍼티 등 메타데이터 관리, 첨부파일 업로드·다운로드를 지원합니다.
 
 AI 모델(Claude 등)이 MCP 도구로 사용하기 적합하도록 설계되었으며,
@@ -26,16 +26,16 @@ npm install
 cp .env.example .env
 ```
 
-### `.env` 예시
+### `.env` 예시 (Cloud)
 
 ```dotenv
-# Atlassian 도메인 — https:// 없이 도메인만 입력
+# 사이트 주소 — https:// 없이 도메인만 입력
 CONFLUENCE_DOMAIN=yourcompany.atlassian.net
+CONFLUENCE_CONTEXT_PATH=/wiki
 
-# Atlassian 계정 이메일
+# 인증 (basic = 이메일 + API 토큰)
+CONFLUENCE_AUTH_TYPE=basic
 CONFLUENCE_EMAIL=you@example.com
-
-# Atlassian API 토큰
 # 발급 위치: https://id.atlassian.com/manage-profile/security/api-tokens
 CONFLUENCE_API_TOKEN=ATATxxxxxxxxxxxxxxxxxxxxxxxx
 
@@ -44,6 +44,39 @@ CONFLUENCE_API_TOKEN=ATATxxxxxxxxxxxxxxxxxxxxxxxx
 ```
 
 > **API 토큰 발급**: Atlassian 계정 → 보안 설정 → [API 토큰 생성](https://id.atlassian.com/manage-profile/security/api-tokens)
+
+### `.env` 예시 (Server / Data Center)
+
+```dotenv
+CONFLUENCE_BASE_URL=https://confluence.example.com/confluence
+
+CONFLUENCE_AUTH_TYPE=basic
+CONFLUENCE_USERNAME=your_username
+CONFLUENCE_SECRET=your_password_or_pat
+```
+
+### 플랫폼 / API 버전 자동 판별
+
+`CONFLUENCE_PLATFORM`, `CONFLUENCE_API_VERSION`은 생략 가능합니다. 지정하지 않으면
+도메인(`CONFLUENCE_DOMAIN` 또는 `CONFLUENCE_BASE_URL`)을 보고 자동으로 결정합니다.
+
+| 도메인 | platform | API 버전 |
+|---|---|---|
+| `*.atlassian.net` | `cloud` | `v2` |
+| 그 외 | `server` | `v1` |
+
+자동 판별이 맞지 않는 경우(예: Cloud 커스텀 도메인)에만 `.env`에 `CONFLUENCE_PLATFORM`,
+`CONFLUENCE_API_VERSION`을 명시적으로 지정하세요.
+
+### 인증 방식 선택 (`CONFLUENCE_AUTH_TYPE`)
+
+| 값 | 전송 방식 | 필요한 변수 | 주로 사용하는 경우 |
+|---|---|---|---|
+| `basic` (기본값) | `Authorization: Basic <base64>` | `CONFLUENCE_EMAIL`/`CONFLUENCE_USERNAME` + `CONFLUENCE_API_TOKEN`/`CONFLUENCE_SECRET` | Cloud API 토큰, Server/DC 계정 비밀번호나 PAT |
+| `bearer` | `Authorization: Bearer <token>` | `CONFLUENCE_SECRET`만 | Cloud OAuth access token, Bearer 방식을 요구하는 Server/DC PAT |
+
+대부분의 Cloud 개인 API 토큰 사용자는 `basic`이면 충분합니다. 전체 변수 목록과 설명은
+[`.env.example`](./.env.example)을 참고하세요.
 
 ---
 
@@ -495,4 +528,4 @@ node confluence-api-cli.js --list-pages --space-id 790397104 2>/dev/null | jq '.
 ## 요구 사항
 
 - Node.js 20 이상 (native `fetch`, `FormData` 사용)
-- Atlassian Confluence Cloud 계정 및 API 토큰
+- Atlassian Confluence Cloud 계정(API 토큰) 또는 Server/Data Center 계정(비밀번호·PAT)
