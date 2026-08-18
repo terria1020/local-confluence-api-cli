@@ -3,20 +3,18 @@
 /**
  * confluence-api-cli.js
  *
- * A CLI tool for interacting with Confluence Cloud REST API v2
+ * A CLI tool for interacting with Confluence Cloud REST API v1/v2
  * - Content management: create, read, update, delete pages
  * - Metadata management: labels, properties, versions, comments
  * - Attachment management: upload, list, delete, download
  *
- * Credentials are managed via environment variables:
- *   CONFLUENCE_DOMAIN   - e.g. yourcompany.atlassian.net
- *   CONFLUENCE_EMAIL    - Atlassian account email
- *   CONFLUENCE_API_TOKEN - API token from id.atlassian.com/manage-profile/security/api-tokens
+ * Credentials are managed in credentials.json beside this script.
+ * Select a configured site with --site / -s. Tokens and secrets must be Base64 encoded.
  *
  * Usage:
  *   node confluence-api-cli.js --help
- *   node confluence-api-cli.js --get-page <page-id>
- *   node confluence-api-cli.js --create-page --title "제목" --space-id "~12345" --body "<p>내용</p>"
+ *   node confluence-api-cli.js --site my-cloud --get-page <page-id>
+ *   node confluence-api-cli.js --site my-cloud --create-page --title "제목" --space-id "~12345" --body "<p>내용</p>"
  */
 
 'use strict';
@@ -25,10 +23,10 @@ const fs = require('fs');
 const path = require('path');
 const winston = require('winston');
 
-require('dotenv').config({ path: path.resolve(process.cwd(), '.env') });
-
 // ─── Constants ────────────────────────────────────────────────────────────────
 
+const SCRIPT_DIR = __dirname;
+const CREDENTIALS_PATH = path.join(SCRIPT_DIR, 'credentials.json');
 const LOG_DIR = path.join(process.cwd(), 'logs');
 fs.mkdirSync(LOG_DIR, { recursive: true });
 
@@ -92,28 +90,162 @@ function die(msg) {
   throw CLI_EXIT;
 }
 
+function decodeBase64(value) {
+  if (!value) return '';
+  if (typeof value !== 'string' || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value)) {
+    die('site.apiToken or site.secret must be a valid Base64 string.');
+  }
+  try {
+    return Buffer.from(value, 'base64').toString('utf8');
+  } catch (_) {
+    die('Failed to decode Base64 value in credentials.');
+  }
+}
+
+function loadCredentials(credentialsPath) {
+  const resolvedPath = credentialsPath || CREDENTIALS_PATH;
+  if (!fs.existsSync(resolvedPath)) {
+    die(
+      `credentials.json not found at: ${resolvedPath}\n` +
+      '  Copy credentials.example.json to credentials.json and fill values.'
+    );
+  }
+
+  let data;
+  try {
+    data = JSON.parse(fs.readFileSync(resolvedPath, 'utf8'));
+  } catch (err) {
+    die(`Cannot read valid JSON from credential file: ${err.message}`);
+  }
+
+  if (!Array.isArray(data.sites)) {
+    die('credentials.json must have a "sites" array.');
+  }
+  return data;
+}
+
+function getSite(data, id) {
+  const site = data.sites.find((candidate) => candidate.id === id);
+  if (!site) {
+    const ids = data.sites.map((candidate) => candidate.id).join(', ');
+    die(`Site "${id}" not found.\n  Available: ${ids || '(none)'}`);
+  }
+  return site;
+}
+
+function printSiteList(data) {
+  const sites = data.sites.map((site) => ({
+    id: site.id,
+    name: site.name || '',
+    domain: site.domain || site.baseUrl || '',
+    platform: site.platform || '',
+    authType: site.authType || 'basic',
+    note: site.note || '',
+  }));
+  console.log(JSON.stringify(sites, null, 2));
+}
+
 // ─── Confluence Client ────────────────────────────────────────────────────────
 
-function initClient() {
-  const domain = process.env.CONFLUENCE_DOMAIN;
-  const email = process.env.CONFLUENCE_EMAIL;
-  const token = process.env.CONFLUENCE_API_TOKEN;
+function initClient(siteId, credentialsPath) {
+  const site = getSite(loadCredentials(credentialsPath), siteId);
+  const domain = site.domain;
+  const platform = site.platform
+    ? normalizePlatform(site.platform)
+    : inferPlatform(site.baseUrl, domain);
+  const contextPath = normalizeContextPath(
+    site.contextPath || (platform === 'cloud' ? '/wiki' : '')
+  );
+  const baseUrl = site.baseUrl || (domain ? `https://${domain}${contextPath}` : null);
+  const username = site.username || site.email;
+  const secret = decodeBase64(site.secret || site.apiToken);
+  const defaultAuthType = normalizeAuthType(site.authType || 'basic');
+  const v1AuthType = normalizeAuthType(site.v1AuthType || defaultAuthType);
+  const v2AuthType = normalizeAuthType(site.v2AuthType || defaultAuthType);
+  const defaultApiVersion = normalizeApiVersion(
+    site.apiVersion || (platform === 'server' ? 'v1' : 'v2')
+  );
 
-  if (!domain) die('CONFLUENCE_DOMAIN environment variable not set.');
-  if (!email) die('CONFLUENCE_EMAIL environment variable not set.');
-  if (!token) die('CONFLUENCE_API_TOKEN environment variable not set.');
+  if (!baseUrl) die('site.baseUrl or site.domain is required.');
+  if (!secret) die('site.secret or site.apiToken is required and must be Base64 encoded.');
+  if (defaultAuthType === 'basic' && !username) {
+    die('Basic auth requires site.username or site.email.');
+  }
 
-  const baseAuth = Buffer.from(`${email}:${token}`).toString('base64');
-  const baseUrl = `https://${domain}/wiki`;
+  const baseAuth = username ? Buffer.from(`${username}:${secret}`).toString('base64') : null;
+  const siteOrigin = new URL(baseUrl).origin;
 
-  logger.debug(`Confluence client initialized for domain: ${domain}`);
+  logger.debug(`Confluence client initialized for platform: ${platform}, baseUrl: ${baseUrl}`);
 
-  async function request(method, endpoint, body = null, isV1 = false) {
-    const apiBase = isV1 ? `${baseUrl}/rest/api` : `${baseUrl}/api/v2`;
+  function authTypeFor(apiVersion) {
+    return apiVersion === 'v1' ? v1AuthType : v2AuthType;
+  }
+
+  function authHeaderFor(apiVersion) {
+    const authType = authTypeFor(apiVersion);
+    if (authType === 'bearer') return `Bearer ${secret}`;
+    if (!baseAuth) die('Basic auth requires site.username/site.email plus site.secret/site.apiToken.');
+    return `Basic ${baseAuth}`;
+  }
+
+  function apiBaseFor(apiVersion) {
+    if (platform === 'server') {
+      if (apiVersion && normalizeApiVersion(apiVersion) !== 'v1') {
+        die('Confluence Server/Data Center only supports v1 REST routes in this CLI.');
+      }
+      return `${baseUrl}/rest/api`;
+    }
+    return normalizeApiVersion(apiVersion) === 'v1' ? `${baseUrl}/rest/api` : `${baseUrl}/api/v2`;
+  }
+
+  function isV2(apiVersion = defaultApiVersion) {
+    return platform === 'cloud' && normalizeApiVersion(apiVersion) === 'v2';
+  }
+
+  function webUrlFor(pathname) {
+    if (!pathname) return null;
+    return `${baseUrl}${pathname}`;
+  }
+
+  function pagePath(pageId, apiVersion = defaultApiVersion) {
+    return isV2(apiVersion) ? `/pages/${pageId}` : `/content/${pageId}`;
+  }
+
+  function pagesCollectionPath(apiVersion = defaultApiVersion) {
+    return isV2(apiVersion) ? '/pages' : '/content';
+  }
+
+  function childrenPath(pageId, apiVersion = defaultApiVersion) {
+    return isV2(apiVersion) ? `/pages/${pageId}/children` : `/content/${pageId}/child/page`;
+  }
+
+  function labelsPath(pageId, apiVersion = defaultApiVersion) {
+    return isV2(apiVersion) ? `/pages/${pageId}/labels` : `/content/${pageId}/label`;
+  }
+
+  function propertiesPath(pageId, apiVersion = defaultApiVersion) {
+    return isV2(apiVersion) ? `/pages/${pageId}/properties` : `/content/${pageId}/property`;
+  }
+
+  function versionsPath(pageId, apiVersion = defaultApiVersion) {
+    return isV2(apiVersion) ? `/pages/${pageId}/versions` : `/content/${pageId}/version`;
+  }
+
+  function commentsPath(pageId, apiVersion = defaultApiVersion) {
+    return isV2(apiVersion) ? `/pages/${pageId}/footer-comments` : `/content/${pageId}/child/comment`;
+  }
+
+  function attachmentsPath(pageId, apiVersion = defaultApiVersion) {
+    return isV2(apiVersion) ? `/attachments?pageId=${encodeURIComponent(pageId)}` : `/content/${pageId}/child/attachment`;
+  }
+
+  async function request(method, endpoint, body = null, apiVersion = defaultApiVersion) {
+    const resolvedVersion = normalizeApiVersion(apiVersion);
+    const apiBase = apiBaseFor(resolvedVersion);
     const url = `${apiBase}${endpoint}`;
 
     const headers = {
-      'Authorization': `Basic ${baseAuth}`,
+      'Authorization': authHeaderFor(resolvedVersion),
       'Accept': 'application/json',
     };
 
@@ -154,11 +286,12 @@ function initClient() {
     }
   }
 
-  async function downloadRaw(endpoint) {
-    const url = `${baseUrl}/api/v2${endpoint}`;
+  async function downloadRaw(endpoint, apiVersion = defaultApiVersion) {
+    const resolvedVersion = normalizeApiVersion(apiVersion);
+    const url = `${apiBaseFor(resolvedVersion)}${endpoint}`;
     const res = await fetch(url, {
       method: 'GET',
-      headers: { 'Authorization': `Basic ${baseAuth}` },
+      headers: { 'Authorization': authHeaderFor(resolvedVersion) },
       redirect: 'follow',
     });
 
@@ -169,10 +302,71 @@ function initClient() {
     return res;
   }
 
-  return { request, downloadRaw, baseUrl };
+  return {
+    request,
+    downloadRaw,
+    baseUrl,
+    siteOrigin,
+    platform,
+    isV2,
+    apiBaseFor,
+    authHeaderFor,
+    webUrlFor,
+    pagePath,
+    pagesCollectionPath,
+    childrenPath,
+    labelsPath,
+    propertiesPath,
+    versionsPath,
+    commentsPath,
+    attachmentsPath,
+    defaultApiVersion,
+  };
 }
 
 // ─── Helper ───────────────────────────────────────────────────────────────────
+
+function normalizeAuthType(value) {
+  const normalized = String(value || '').trim().toLowerCase();
+  if (!normalized) return 'basic';
+  if (normalized === 'basic' || normalized === 'bearer') return normalized;
+  die(`site.authType must be either "basic" or "bearer" (got "${value}")`);
+}
+
+function inferPlatform(baseUrlOverride, domain) {
+  let host = '';
+  try {
+    host = new URL(baseUrlOverride || `https://${domain || ''}`).hostname;
+  } catch (_) {
+    host = domain || '';
+  }
+  const platform = /(^|\.)atlassian\.net$/i.test(host) ? 'cloud' : 'server';
+  logger.debug(`site.platform not set, inferred "${platform}" from host: ${host}`);
+  return platform;
+}
+
+function normalizePlatform(value) {
+  const normalized = String(value || '').trim().toLowerCase();
+  if (!normalized || normalized === 'cloud' || normalized === 'on-demand' || normalized === 'ondemand') return 'cloud';
+  if (normalized === 'server' || normalized === 'dc' || normalized === 'datacenter' || normalized === 'data-center' || normalized === 'onprem' || normalized === 'on-prem') {
+    return 'server';
+  }
+  die(`site.platform must be either "cloud" or "server" (got "${value}")`);
+}
+
+function normalizeContextPath(value) {
+  const normalized = String(value || '').trim();
+  if (!normalized || normalized === '/') return '';
+  const withLeadingSlash = normalized.startsWith('/') ? normalized : `/${normalized}`;
+  return withLeadingSlash.replace(/\/+$/, '');
+}
+
+function normalizeApiVersion(value) {
+  const normalized = String(value || '').trim().toLowerCase();
+  if (!normalized) return 'v2';
+  if (normalized === 'v1' || normalized === 'v2') return normalized;
+  die(`site.apiVersion must be either "v1" or "v2" (got "${value}")`);
+}
 
 function parseJsonOption(jsonString, optionName) {
   if (!jsonString) die(`--${optionName} requires a JSON string`);
@@ -200,31 +394,36 @@ function buildQueryString(params) {
 
 async function getPage(client, pageId) {
   logger.info(`Fetching page: ${pageId}`);
-  const data = await client.request('GET', `/pages/${pageId}?body-format=storage`);
+  const endpoint = client.isV2()
+    ? `${client.pagePath(pageId)}?body-format=storage`
+    : `${client.pagePath(pageId)}?expand=body.storage,version,space,ancestors`;
+  const data = await client.request('GET', endpoint);
   console.log(JSON.stringify({
     id: data.id,
     title: data.title,
     status: data.status,
-    spaceId: data.spaceId,
-    parentId: data.parentId,
+    spaceId: data.spaceId || data.space?.key || null,
+    parentId: data.parentId || data.ancestors?.[data.ancestors.length - 1]?.id || null,
     version: data.version?.number,
     createdAt: data.createdAt,
     authorId: data.ownerId,
     body: data.body?.storage?.value || '',
-    webUrl: data._links?.webui ? `https://${process.env.CONFLUENCE_DOMAIN}/wiki${data._links.webui}` : null,
+    webUrl: client.webUrlFor(data._links?.webui || data._links?.base || null),
   }, null, 2));
 }
 
 async function listPages(client, spaceId, title, limit) {
   logger.info('Listing pages');
-  const qs = buildQueryString({ 'space-id': spaceId, title, limit });
-  const data = await client.request('GET', `/pages${qs}`);
+  const qs = client.isV2()
+    ? buildQueryString({ 'space-id': spaceId, title, limit })
+    : buildQueryString({ type: 'page', spaceKey: spaceId, title, limit });
+  const data = await client.request('GET', `${client.pagesCollectionPath()}${qs}`);
   const results = (data.results || []).map(p => ({
     id: p.id,
     title: p.title,
     status: p.status,
-    spaceId: p.spaceId,
-    parentId: p.parentId,
+    spaceId: p.spaceId || p.space?.key || null,
+    parentId: p.parentId || p.ancestors?.[p.ancestors.length - 1]?.id || null,
     version: p.version?.number,
   }));
   console.log(JSON.stringify({ count: results.length, pages: results }, null, 2));
@@ -236,27 +435,52 @@ async function createPage(client, title, spaceId, body, parentId) {
 
   logger.info(`Creating page: "${title}" in space ${spaceId}`);
 
+  if (client.isV2()) {
+    const payload = {
+      spaceId,
+      status: 'current',
+      title,
+      body: {
+        representation: 'storage',
+        value: body || '',
+      },
+    };
+    if (parentId) payload.parentId = parentId;
+    const data = await client.request('POST', '/pages', payload);
+    console.log(JSON.stringify({
+      id: data.id,
+      title: data.title,
+      status: data.status,
+      spaceId: data.spaceId,
+      parentId: data.parentId,
+      version: data.version?.number,
+      webUrl: client.webUrlFor(data._links?.webui || data._links?.base || null),
+    }, null, 2));
+    return;
+  }
+
   const payload = {
-    spaceId,
-    status: 'current',
+    type: 'page',
     title,
+    space: { key: spaceId },
     body: {
-      representation: 'storage',
-      value: body || '',
+      storage: {
+        representation: 'storage',
+        value: body || '',
+      },
     },
   };
+  if (parentId) payload.ancestors = [{ id: parentId }];
 
-  if (parentId) payload.parentId = parentId;
-
-  const data = await client.request('POST', '/pages', payload);
+  const data = await client.request('POST', '/content', payload);
   console.log(JSON.stringify({
     id: data.id,
     title: data.title,
     status: data.status,
-    spaceId: data.spaceId,
-    parentId: data.parentId,
+    spaceId: data.spaceId || data.space?.key || null,
+    parentId: data.parentId || data.ancestors?.[data.ancestors.length - 1]?.id || null,
     version: data.version?.number,
-    webUrl: data._links?.webui ? `https://${process.env.CONFLUENCE_DOMAIN}/wiki${data._links.webui}` : null,
+    webUrl: client.webUrlFor(data._links?.webui || data._links?.base || null),
   }, null, 2));
 }
 
@@ -264,22 +488,36 @@ async function updatePage(client, pageId, title, body) {
   if (!title && body === undefined) die('--update-page requires at least --title or --body');
 
   logger.info(`Fetching current version for page: ${pageId}`);
-  const current = await client.request('GET', `/pages/${pageId}?body-format=storage`);
+  const current = await client.request('GET', client.isV2()
+    ? `${client.pagePath(pageId)}?body-format=storage`
+    : `${client.pagePath(pageId)}?expand=body.storage,version,space,ancestors`);
   const currentVersion = current.version?.number || 1;
 
-  const payload = {
-    id: pageId,
-    status: 'current',
-    title: title || current.title,
-    version: { number: currentVersion + 1 },
-    body: {
-      representation: 'storage',
-      value: body !== undefined ? body : (current.body?.storage?.value || ''),
-    },
-  };
-
   logger.info(`Updating page: ${pageId} (version ${currentVersion} → ${currentVersion + 1})`);
-  const data = await client.request('PUT', `/pages/${pageId}`, payload);
+  const data = client.isV2()
+    ? await client.request('PUT', client.pagePath(pageId), {
+        id: pageId,
+        status: 'current',
+        title: title || current.title,
+        version: { number: currentVersion + 1 },
+        body: {
+          representation: 'storage',
+          value: body !== undefined ? body : (current.body?.storage?.value || ''),
+        },
+      })
+    : await client.request('PUT', client.pagePath(pageId), {
+        id: pageId,
+        type: 'page',
+        title: title || current.title,
+        version: { number: currentVersion + 1 },
+        space: { key: current.spaceId || current.space?.key },
+        body: {
+          storage: {
+            representation: 'storage',
+            value: body !== undefined ? body : (current.body?.storage?.value || ''),
+          },
+        },
+      });
   console.log(JSON.stringify({
     id: data.id,
     title: data.title,
@@ -290,19 +528,19 @@ async function updatePage(client, pageId, title, body) {
 
 async function deletePage(client, pageId) {
   logger.info(`Deleting page: ${pageId}`);
-  await client.request('DELETE', `/pages/${pageId}`);
+  await client.request('DELETE', client.pagePath(pageId));
   console.log(JSON.stringify({ success: true, pageId, message: 'Page moved to trash' }, null, 2));
 }
 
 async function getChildren(client, pageId, limit) {
   logger.info(`Fetching children of page: ${pageId}`);
   const qs = buildQueryString({ limit });
-  const data = await client.request('GET', `/pages/${pageId}/children${qs}`);
+  const data = await client.request('GET', `${client.childrenPath(pageId)}${qs}`);
   const results = (data.results || []).map(p => ({
     id: p.id,
     title: p.title,
     status: p.status,
-    spaceId: p.spaceId,
+    spaceId: p.spaceId || p.space?.key || null,
     version: p.version?.number,
   }));
   console.log(JSON.stringify({ parentId: pageId, count: results.length, children: results }, null, 2));
@@ -312,7 +550,7 @@ async function search(client, cql, limit) {
   if (!cql) die('--cql is required for --search');
   logger.info(`Searching with CQL: ${cql}`);
   const qs = buildQueryString({ cql, limit });
-  const data = await client.request('GET', `/search${qs}`, null, true);
+  const data = await client.request('GET', `/search${qs}`, null, 'v1');
   const results = (data.results || []).map(r => ({
     id: r.content?.id,
     type: r.content?.type,
@@ -329,7 +567,7 @@ async function search(client, cql, limit) {
 
 async function listLabels(client, pageId) {
   logger.info(`Fetching labels for page: ${pageId}`);
-  const data = await client.request('GET', `/pages/${pageId}/labels`);
+  const data = await client.request('GET', client.labelsPath(pageId));
   const labels = (data.results || []).map(l => ({
     id: l.id,
     name: l.name,
@@ -352,7 +590,7 @@ async function addLabels(client, pageId, labelsInput) {
 
   logger.info(`Adding labels to page ${pageId}: ${names.join(', ')}`);
   const payload = names.map(name => ({ name, prefix: 'global' }));
-  const data = await client.request('POST', `/pages/${pageId}/labels`, payload);
+  const data = await client.request('POST', client.labelsPath(pageId), payload);
   const labels = (data.results || []).map(l => ({ id: l.id, name: l.name, prefix: l.prefix }));
   console.log(JSON.stringify({ pageId, added: names, labels }, null, 2));
 }
@@ -361,11 +599,16 @@ async function removeLabel(client, pageId, labelName) {
   if (!labelName) die('--label is required for --remove-label');
   logger.info(`Removing label "${labelName}" from page ${pageId}`);
 
-  const listData = await client.request('GET', `/pages/${pageId}/labels`);
+  const listData = await client.request('GET', client.labelsPath(pageId));
   const found = (listData.results || []).find(l => l.name === labelName);
   if (!found) die(`Label "${labelName}" not found on page ${pageId}`);
 
-  await client.request('DELETE', `/pages/${pageId}/labels/${found.id}`);
+  if (client.isV2()) {
+    await client.request('DELETE', `${client.labelsPath(pageId)}/${found.id}`);
+  } else {
+    const qs = buildQueryString({ name: labelName, prefix: found.prefix || 'global' });
+    await client.request('DELETE', `${client.labelsPath(pageId)}${qs}`);
+  }
   console.log(JSON.stringify({ success: true, pageId, removedLabel: labelName }, null, 2));
 }
 
@@ -373,7 +616,7 @@ async function removeLabel(client, pageId, labelName) {
 
 async function listProperties(client, pageId) {
   logger.info(`Fetching properties for page: ${pageId}`);
-  const data = await client.request('GET', `/pages/${pageId}/properties`);
+  const data = await client.request('GET', client.propertiesPath(pageId));
   const props = (data.results || []).map(p => ({
     id: p.id,
     key: p.key,
@@ -397,19 +640,19 @@ async function setProperty(client, pageId, key, valueInput) {
   // Check if property already exists to decide POST vs PUT
   let existing = null;
   try {
-    existing = await client.request('GET', `/pages/${pageId}/properties/${key}`);
+    existing = await client.request('GET', `${client.propertiesPath(pageId)}/${key}`);
   } catch (_) {}
 
   if (existing) {
     const currentVersion = existing.version?.number || 1;
     logger.info(`Updating property "${key}" on page ${pageId} (version ${currentVersion} → ${currentVersion + 1})`);
     const payload = { key, value, version: { number: currentVersion + 1 } };
-    const data = await client.request('PUT', `/pages/${pageId}/properties/${key}`, payload);
+    const data = await client.request('PUT', `${client.propertiesPath(pageId)}/${key}`, payload);
     console.log(JSON.stringify({ pageId, key: data.key, value: data.value, version: data.version?.number }, null, 2));
   } else {
     logger.info(`Creating property "${key}" on page ${pageId}`);
     const payload = { key, value };
-    const data = await client.request('POST', `/pages/${pageId}/properties`, payload);
+    const data = await client.request('POST', client.propertiesPath(pageId), payload);
     console.log(JSON.stringify({ pageId, key: data.key, value: data.value, version: data.version?.number }, null, 2));
   }
 }
@@ -417,7 +660,7 @@ async function setProperty(client, pageId, key, valueInput) {
 async function deleteProperty(client, pageId, key) {
   if (!key) die('--key is required for --delete-property');
   logger.info(`Deleting property "${key}" from page ${pageId}`);
-  await client.request('DELETE', `/pages/${pageId}/properties/${key}`);
+  await client.request('DELETE', `${client.propertiesPath(pageId)}/${key}`);
   console.log(JSON.stringify({ success: true, pageId, deletedKey: key }, null, 2));
 }
 
@@ -426,7 +669,7 @@ async function deleteProperty(client, pageId, key) {
 async function listVersions(client, pageId, limit) {
   logger.info(`Fetching versions for page: ${pageId}`);
   const qs = buildQueryString({ limit });
-  const data = await client.request('GET', `/pages/${pageId}/versions${qs}`);
+  const data = await client.request('GET', `${client.versionsPath(pageId)}${qs}`);
   const versions = (data.results || []).map(v => ({
     number: v.number,
     authorId: v.authorId,
@@ -442,7 +685,7 @@ async function listVersions(client, pageId, limit) {
 async function listComments(client, pageId, limit) {
   logger.info(`Fetching footer comments for page: ${pageId}`);
   const qs = buildQueryString({ limit });
-  const data = await client.request('GET', `/pages/${pageId}/footer-comments${qs}`);
+  const data = await client.request('GET', `${client.commentsPath(pageId)}${qs}`);
   const comments = (data.results || []).map(c => ({
     id: c.id,
     status: c.status,
@@ -456,14 +699,25 @@ async function listComments(client, pageId, limit) {
 async function addComment(client, pageId, body) {
   if (!body) die('--body is required for --add-comment');
   logger.info(`Adding comment to page: ${pageId}`);
-  const payload = {
-    pageId,
-    body: {
-      representation: 'storage',
-      value: body,
-    },
-  };
-  const data = await client.request('POST', '/footer-comments', payload);
+  const payload = client.isV2()
+    ? {
+        pageId,
+        body: {
+          representation: 'storage',
+          value: body,
+        },
+      }
+    : {
+        type: 'comment',
+        container: { id: pageId, type: 'page' },
+        body: {
+          storage: {
+            representation: 'storage',
+            value: body,
+          },
+        },
+      };
+  const data = await client.request('POST', client.commentsPath(pageId), payload);
   console.log(JSON.stringify({
     id: data.id,
     pageId: data.pageId,
@@ -477,8 +731,10 @@ async function addComment(client, pageId, body) {
 
 async function listAttachments(client, pageId) {
   logger.info(`Fetching attachments for page: ${pageId}`);
-  const qs = buildQueryString({ 'pageId': pageId });
-  const data = await client.request('GET', `/attachments${qs}`);
+  const endpoint = client.isV2()
+    ? client.attachmentsPath(pageId)
+    : client.attachmentsPath(pageId);
+  const data = await client.request('GET', endpoint);
   const attachments = (data.results || []).map(a => ({
     id: a.id,
     title: a.title,
@@ -506,17 +762,12 @@ async function uploadAttachment(client, pageId, filePath) {
   formData.append('comment', `Uploaded via ${APP_NAME}`);
   formData.append('minorEdit', 'true');
 
-  const domain = process.env.CONFLUENCE_DOMAIN;
-  const email = process.env.CONFLUENCE_EMAIL;
-  const token = process.env.CONFLUENCE_API_TOKEN;
-  const baseAuth = Buffer.from(`${email}:${token}`).toString('base64');
-
   // v2 API는 attachment POST 미지원 → v1 endpoint 사용
-  const url = `https://${domain}/wiki/rest/api/content/${pageId}/child/attachment`;
+  const url = `${client.apiBaseFor('v1')}/content/${pageId}/child/attachment`;
   const res = await fetch(url, {
     method: 'POST',
     headers: {
-      'Authorization': `Basic ${baseAuth}`,
+      'Authorization': client.authHeaderFor('v1'),
       'Accept': 'application/json',
       'X-Atlassian-Token': 'no-check',
     },
@@ -555,11 +806,11 @@ async function downloadAttachment(client, attachmentId, outputPath) {
   if (!outputPath) die('--output is required for --download-attachment');
 
   logger.info(`Fetching attachment info: ${attachmentId}`);
-  const info = await client.request('GET', `/attachments/${attachmentId}`);
+  const info = await client.request('GET', `/attachments/${attachmentId}`, null, 'v1');
   const filename = info.title || attachmentId;
 
   logger.info(`Downloading attachment: ${filename}`);
-  const res = await client.downloadRaw(`/attachments/${attachmentId}/download`);
+  const res = await client.downloadRaw(`/attachments/${attachmentId}/download`, 'v1');
 
   const resolvedOutput = path.resolve(outputPath);
   const buffer = Buffer.from(await res.arrayBuffer());
@@ -658,59 +909,77 @@ Usage: confluence-api-cli [command] [options]
 
 ─── Examples ─────────────────────────────────────────────────────────────────
 
-  node confluence-api-cli.js --get-page 123456789
-  node confluence-api-cli.js --list-pages --space-id "~12345" --limit 10
-  node confluence-api-cli.js --create-page --title "신규 페이지" --space-id "~12345" --body "<p>내용</p>"
-  node confluence-api-cli.js --create-page --title "하위 페이지" --space-id "~12345" --parent-id 123456789 --body "<p>내용</p>"
-  node confluence-api-cli.js --update-page 123456789 --title "수정된 제목" --body "<p>수정된 내용</p>"
-  node confluence-api-cli.js --delete-page 123456789
-  node confluence-api-cli.js --get-children 123456789 --limit 20
-  node confluence-api-cli.js --search --cql "type=page AND title~\"배포\"" --limit 10
+  node confluence-api-cli.js --list-sites
+  node confluence-api-cli.js --site my-cloud --get-page 123456789
+  node confluence-api-cli.js --site my-server --list-pages --space-id "~12345" --limit 10
+  node confluence-api-cli.js --site my-cloud --create-page --title "신규 페이지" --space-id "~12345" --body "<p>내용</p>"
 
-  node confluence-api-cli.js --list-labels 123456789
-  node confluence-api-cli.js --add-labels 123456789 --labels "bug,urgent"
-  node confluence-api-cli.js --remove-label 123456789 --label "bug"
-  node confluence-api-cli.js --list-properties 123456789
-  node confluence-api-cli.js --set-property 123456789 --key "status" --value "done"
-  node confluence-api-cli.js --set-property 123456789 --key "meta" --value '{"env":"prod","version":2}'
-  node confluence-api-cli.js --delete-property 123456789 --key "status"
-  node confluence-api-cli.js --list-versions 123456789 --limit 5
-  node confluence-api-cli.js --list-comments 123456789
-  node confluence-api-cli.js --add-comment 123456789 --body "<p>확인 부탁드립니다.</p>"
+─── Credentials ──────────────────────────────────────────────────────────────
 
-  node confluence-api-cli.js --list-attachments 123456789
-  node confluence-api-cli.js --upload-attachment 123456789 --file ./report.pdf
-  node confluence-api-cli.js --delete-attachment att-abc123
-  node confluence-api-cli.js --download-attachment att-abc123 --output ./downloaded.pdf
+  -s, --site <id>                 credentials.json의 site ID (명령 실행 시 필수)
+  --credentials-path <path>       자격증명 파일 경로 (기본: 스크립트 옆 credentials.json)
+  --list-sites                    비밀값을 제외한 사용 가능한 site 목록 출력
 
-─── Environment ──────────────────────────────────────────────────────────────
-
-  CONFLUENCE_DOMAIN       Atlassian 도메인 (예: yourcompany.atlassian.net)
-  CONFLUENCE_EMAIL        Atlassian 계정 이메일
-  CONFLUENCE_API_TOKEN    API 토큰 (https://id.atlassian.com/manage-profile/security/api-tokens)
-  LOG_LEVEL               로그 레벨 (기본: info)
+  credentials.json의 apiToken 또는 secret은 Base64 인코딩해야 합니다.
+  예: echo -n 'TOKEN' | base64
 
 ─── Setup ────────────────────────────────────────────────────────────────────
 
-  1. .env.example 을 .env 로 복사
-  2. CONFLUENCE_DOMAIN, CONFLUENCE_EMAIL, CONFLUENCE_API_TOKEN 설정
-  3. CLI 실행
+  1. credentials.example.json을 credentials.json으로 복사
+  2. site 설정과 Base64 인코딩한 토큰/비밀값 입력
+  3. --site <id>를 지정하여 CLI 실행
 `);
 }
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
-async function main() {
-  const args = process.argv.slice(2);
+function parseGlobalOptions(argv) {
+  const options = {
+    siteId: null,
+    credentialsPath: null,
+    listSites: false,
+    commandArgs: [],
+  };
 
-  if (args.length === 0 || args.includes('--help') || args.includes('-h')) {
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg === '--site' || arg === '-s') {
+      if (!argv[i + 1]) die(`${arg} requires a site ID`);
+      options.siteId = argv[++i];
+    } else if (arg === '--credentials-path') {
+      if (!argv[i + 1]) die('--credentials-path requires a path');
+      options.credentialsPath = argv[++i];
+    } else if (arg === '--list-sites') {
+      options.listSites = true;
+    } else {
+      options.commandArgs.push(arg);
+    }
+  }
+  return options;
+}
+
+async function main() {
+  const rawArgs = process.argv.slice(2);
+
+  if (rawArgs.length === 0 || rawArgs.includes('--help') || rawArgs.includes('-h')) {
     printHelp();
     exitCli(0);
     return;
   }
 
   try {
-    const client = initClient();
+    const options = parseGlobalOptions(rawArgs);
+    if (options.listSites) {
+      if (options.commandArgs.length > 0) die('--list-sites must be used without another command.');
+      printSiteList(loadCredentials(options.credentialsPath));
+      exitCli(0);
+      return;
+    }
+    if (!options.siteId) die('Missing -s / --site. Specify a site ID.');
+
+    const args = options.commandArgs;
+    if (args.length === 0) die('Missing command. Run with --help to see available commands.');
+    const client = initClient(options.siteId, options.credentialsPath);
     const cmd = args[0];
 
     // ── Content Management ──────────────────────────────────────────────────

@@ -1,5 +1,9 @@
 # Local credentials (never commit)
 .env
+.env.*
+!.env.example
+credentials.json
+!credentials.example.json
 
 # Dependencies
 node_modules/

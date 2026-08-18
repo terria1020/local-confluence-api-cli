@@ -1,6 +1,6 @@
 # local-confluence-api-cli
 
-Atlassian Confluence Cloud REST API를 사용하는 CLI 도구입니다.
+Atlassian Confluence Cloud 및 Server/Data Center REST API를 사용하는 CLI 도구입니다.
 페이지 생성/수정, 라벨·프로퍼티 등 메타데이터 관리, 첨부파일 업로드·다운로드를 지원합니다.
 
 AI 모델(Claude 등)이 MCP 도구로 사용하기 적합하도록 설계되었으며,
@@ -18,32 +18,64 @@ npm install
 
 ---
 
-## 환경 변수 설정
+## 자격증명 설정
 
-`.env.example`을 `.env`로 복사한 후 값을 채워주세요.
+`credentials.example.json`을 `credentials.json`으로 복사한 후 site 정보를 채워주세요.
+기본 파일은 현재 작업 디렉터리와 무관하게 CLI 스크립트 옆에서 읽습니다.
 
 ```bash
-cp .env.example .env
+cp credentials.example.json credentials.json
 ```
 
-### `.env` 예시
+### `credentials.json` 예시
 
-```dotenv
-# Atlassian 도메인 — https:// 없이 도메인만 입력
-CONFLUENCE_DOMAIN=yourcompany.atlassian.net
-
-# Atlassian 계정 이메일
-CONFLUENCE_EMAIL=you@example.com
-
-# Atlassian API 토큰
-# 발급 위치: https://id.atlassian.com/manage-profile/security/api-tokens
-CONFLUENCE_API_TOKEN=ATATxxxxxxxxxxxxxxxxxxxxxxxx
-
-# 로그 레벨 (debug | info | warn | error) — 기본: info
-# LOG_LEVEL=info
+```json
+{
+  "$schema": "./credentials.schema.json",
+  "version": "1.0",
+  "sites": [
+    {
+      "id": "my-cloud",
+      "name": "My Confluence Cloud",
+      "domain": "yourcompany.atlassian.net",
+      "contextPath": "/wiki",
+      "authType": "basic",
+      "email": "you@example.com",
+      "apiToken": "QVRBVHh4eHh4eHh4eHh4eHh4eA=="
+    },
+    {
+      "id": "my-server",
+      "baseUrl": "https://confluence.example.com/confluence",
+      "authType": "bearer",
+      "secret": "c2VydmVyX3BhdF90b2tlbg=="
+    }
+  ]
+}
 ```
 
-> **API 토큰 발급**: Atlassian 계정 → 보안 설정 → [API 토큰 생성](https://id.atlassian.com/manage-profile/security/api-tokens)
+`apiToken`과 `secret`은 반드시 Base64 인코딩합니다. 예: `echo -n 'TOKEN' | base64`.
+Cloud API 토큰은 [Atlassian API 토큰 관리 페이지](https://id.atlassian.com/manage-profile/security/api-tokens)에서 발급할 수 있습니다.
+
+### 플랫폼 / API 버전 자동 판별
+
+`platform`, `apiVersion`은 생략 가능합니다. 지정하지 않으면 `domain` 또는 `baseUrl`을 보고 자동으로 결정합니다.
+
+| 도메인 | platform | API 버전 |
+|---|---|---|
+| `*.atlassian.net` | `cloud` | `v2` |
+| 그 외 | `server` | `v1` |
+
+자동 판별이 맞지 않는 경우(예: Cloud 커스텀 도메인)에만 site에 `platform`, `apiVersion`을 명시하세요.
+
+### 인증 방식 선택 (`authType`)
+
+| 값 | 전송 방식 | 필요한 변수 | 주로 사용하는 경우 |
+|---|---|---|---|
+| `basic` (기본값) | `Authorization: Basic <base64>` | `email`/`username` + Base64 `apiToken`/`secret` | Cloud API 토큰, Server/DC 계정 비밀번호나 PAT |
+| `bearer` | `Authorization: Bearer <token>` | Base64 `secret` 또는 `apiToken` | Cloud OAuth access token, Bearer 방식을 요구하는 Server/DC PAT |
+
+대부분의 Cloud 개인 API 토큰 사용자는 `basic`이면 충분합니다. 전체 필드와 예시는
+[credentials.example.json](./credentials.example.json)을 참고하세요.
 
 ---
 
@@ -51,14 +83,15 @@ CONFLUENCE_API_TOKEN=ATATxxxxxxxxxxxxxxxxxxxxxxxx
 
 ```bash
 node confluence-api-cli.js --help
-node confluence-api-cli.js <command> [options]
+node confluence-api-cli.js --list-sites
+node confluence-api-cli.js --site <id> <command> [options]
 ```
 
 전역 설치 후 사용:
 
 ```bash
 npm link
-confluence-api-cli --help
+confluence-api-cli --site <id> --help
 ```
 
 ---
@@ -74,7 +107,7 @@ confluence-api-cli --help
 페이지 정보와 본문(HTML storage format)을 조회합니다.
 
 ```bash
-node confluence-api-cli.js --get-page 2569142284
+node confluence-api-cli.js --site <id> --get-page 2569142284
 ```
 
 **출력 예시**
@@ -101,7 +134,7 @@ node confluence-api-cli.js --get-page 2569142284
 페이지 목록을 조회합니다.
 
 ```bash
-node confluence-api-cli.js --list-pages [--space-id <id>] [--title <title>] [--limit <n>]
+node confluence-api-cli.js --site <id> --list-pages [--space-id <id>] [--title <title>] [--limit <n>]
 ```
 
 | 옵션 | 설명 | 기본값 |
@@ -112,10 +145,10 @@ node confluence-api-cli.js --list-pages [--space-id <id>] [--title <title>] [--l
 
 ```bash
 # 스페이스 내 페이지 목록
-node confluence-api-cli.js --list-pages --space-id 790397104 --limit 20
+node confluence-api-cli.js --site <id> --list-pages --space-id 790397104 --limit 20
 
 # 제목 필터
-node confluence-api-cli.js --list-pages --title "Observability"
+node confluence-api-cli.js --site <id> --list-pages --title "Observability"
 ```
 
 ---
@@ -125,7 +158,7 @@ node confluence-api-cli.js --list-pages --title "Observability"
 새 페이지를 생성합니다.
 
 ```bash
-node confluence-api-cli.js --create-page --title <title> --space-id <id> [--body <html>] [--parent-id <id>]
+node confluence-api-cli.js --site <id> --create-page --title <title> --space-id <id> [--body <html>] [--parent-id <id>]
 ```
 
 | 옵션 | 설명 | 필수 |
@@ -137,13 +170,13 @@ node confluence-api-cli.js --create-page --title <title> --space-id <id> [--body
 
 ```bash
 # 루트 페이지 생성
-node confluence-api-cli.js --create-page \
+node confluence-api-cli.js --site <id> --create-page \
   --title "신규 문서" \
   --space-id 790397104 \
   --body "<p>내용을 입력하세요.</p>"
 
 # 하위 페이지 생성
-node confluence-api-cli.js --create-page \
+node confluence-api-cli.js --site <id> --create-page \
   --title "하위 문서" \
   --space-id 790397104 \
   --parent-id 2569142284 \
@@ -159,7 +192,7 @@ node confluence-api-cli.js --create-page \
 기존 페이지를 수정합니다. 현재 버전을 자동으로 조회하여 버전을 증가시킵니다.
 
 ```bash
-node confluence-api-cli.js --update-page <page-id> [--title <title>] [--body <html>]
+node confluence-api-cli.js --site <id> --update-page <page-id> [--title <title>] [--body <html>]
 ```
 
 | 옵션 | 설명 |
@@ -169,13 +202,13 @@ node confluence-api-cli.js --update-page <page-id> [--title <title>] [--body <ht
 
 ```bash
 # 제목만 수정
-node confluence-api-cli.js --update-page 2569142284 --title "GAIA Observability v2"
+node confluence-api-cli.js --site <id> --update-page 2569142284 --title "GAIA Observability v2"
 
 # 본문만 수정
-node confluence-api-cli.js --update-page 2569142284 --body "<p>업데이트된 내용</p>"
+node confluence-api-cli.js --site <id> --update-page 2569142284 --body "<p>업데이트된 내용</p>"
 
 # 제목 + 본문 동시 수정
-node confluence-api-cli.js --update-page 2569142284 \
+node confluence-api-cli.js --site <id> --update-page 2569142284 \
   --title "새 제목" \
   --body "<p>새 내용</p>"
 ```
@@ -187,7 +220,7 @@ node confluence-api-cli.js --update-page 2569142284 \
 페이지를 삭제합니다 (휴지통으로 이동).
 
 ```bash
-node confluence-api-cli.js --delete-page 2569142284
+node confluence-api-cli.js --site <id> --delete-page 2569142284
 ```
 
 ---
@@ -197,11 +230,11 @@ node confluence-api-cli.js --delete-page 2569142284
 페이지의 직접 하위 페이지 목록을 조회합니다.
 
 ```bash
-node confluence-api-cli.js --get-children <page-id> [--limit <n>]
+node confluence-api-cli.js --site <id> --get-children <page-id> [--limit <n>]
 ```
 
 ```bash
-node confluence-api-cli.js --get-children 2569142284 --limit 50
+node confluence-api-cli.js --site <id> --get-children 2569142284 --limit 50
 ```
 
 ---
@@ -211,7 +244,7 @@ node confluence-api-cli.js --get-children 2569142284 --limit 50
 CQL(Confluence Query Language)로 콘텐츠를 검색합니다.
 
 ```bash
-node confluence-api-cli.js --search --cql <query> [--limit <n>]
+node confluence-api-cli.js --site <id> --search --cql <query> [--limit <n>]
 ```
 
 | 옵션 | 설명 | 필수 |
@@ -221,16 +254,16 @@ node confluence-api-cli.js --search --cql <query> [--limit <n>]
 
 ```bash
 # 제목 검색
-node confluence-api-cli.js --search --cql "type=page AND title=\"GAIA Observability\""
+node confluence-api-cli.js --site <id> --search --cql "type=page AND title=\"GAIA Observability\""
 
 # 스페이스 내 검색
-node confluence-api-cli.js --search --cql "type=page AND space=OX AND title~\"배포\"" --limit 10
+node confluence-api-cli.js --site <id> --search --cql "type=page AND space=OX AND title~\"배포\"" --limit 10
 
 # 최근 수정 순 정렬
-node confluence-api-cli.js --search --cql "type=page ORDER BY lastmodified DESC" --limit 5
+node confluence-api-cli.js --site <id> --search --cql "type=page ORDER BY lastmodified DESC" --limit 5
 
 # 특정 라벨이 붙은 페이지
-node confluence-api-cli.js --search --cql "type=page AND label=urgent"
+node confluence-api-cli.js --site <id> --search --cql "type=page AND label=urgent"
 ```
 
 **CQL 주요 연산자**
@@ -253,7 +286,7 @@ node confluence-api-cli.js --search --cql "type=page AND label=urgent"
 페이지에 붙어있는 라벨 목록을 조회합니다.
 
 ```bash
-node confluence-api-cli.js --list-labels 2569142284
+node confluence-api-cli.js --site <id> --list-labels 2569142284
 ```
 
 ---
@@ -263,7 +296,7 @@ node confluence-api-cli.js --list-labels 2569142284
 페이지에 라벨을 추가합니다.
 
 ```bash
-node confluence-api-cli.js --add-labels <page-id> --labels <labels>
+node confluence-api-cli.js --site <id> --add-labels <page-id> --labels <labels>
 ```
 
 | 옵션 | 설명 |
@@ -272,10 +305,10 @@ node confluence-api-cli.js --add-labels <page-id> --labels <labels>
 
 ```bash
 # 쉼표 구분
-node confluence-api-cli.js --add-labels 2569142284 --labels "bug,urgent,review"
+node confluence-api-cli.js --site <id> --add-labels 2569142284 --labels "bug,urgent,review"
 
 # JSON 배열
-node confluence-api-cli.js --add-labels 2569142284 --labels '["bug","urgent"]'
+node confluence-api-cli.js --site <id> --add-labels 2569142284 --labels '["bug","urgent"]'
 ```
 
 ---
@@ -285,11 +318,11 @@ node confluence-api-cli.js --add-labels 2569142284 --labels '["bug","urgent"]'
 페이지에서 특정 라벨을 제거합니다.
 
 ```bash
-node confluence-api-cli.js --remove-label <page-id> --label <name>
+node confluence-api-cli.js --site <id> --remove-label <page-id> --label <name>
 ```
 
 ```bash
-node confluence-api-cli.js --remove-label 2569142284 --label "bug"
+node confluence-api-cli.js --site <id> --remove-label 2569142284 --label "bug"
 ```
 
 ---
@@ -299,7 +332,7 @@ node confluence-api-cli.js --remove-label 2569142284 --label "bug"
 페이지의 커스텀 프로퍼티 목록을 조회합니다.
 
 ```bash
-node confluence-api-cli.js --list-properties 2569142284
+node confluence-api-cli.js --site <id> --list-properties 2569142284
 ```
 
 ---
@@ -309,7 +342,7 @@ node confluence-api-cli.js --list-properties 2569142284
 페이지 프로퍼티를 생성하거나 수정합니다. 키가 없으면 생성, 있으면 수정합니다.
 
 ```bash
-node confluence-api-cli.js --set-property <page-id> --key <key> --value <value>
+node confluence-api-cli.js --site <id> --set-property <page-id> --key <key> --value <value>
 ```
 
 | 옵션 | 설명 | 필수 |
@@ -319,13 +352,13 @@ node confluence-api-cli.js --set-property <page-id> --key <key> --value <value>
 
 ```bash
 # 문자열 값
-node confluence-api-cli.js --set-property 2569142284 --key "status" --value "done"
+node confluence-api-cli.js --site <id> --set-property 2569142284 --key "status" --value "done"
 
 # JSON 객체
-node confluence-api-cli.js --set-property 2569142284 --key "deploy-info" --value '{"env":"prod","version":3}'
+node confluence-api-cli.js --site <id> --set-property 2569142284 --key "deploy-info" --value '{"env":"prod","version":3}'
 
 # 숫자
-node confluence-api-cli.js --set-property 2569142284 --key "priority" --value "1"
+node confluence-api-cli.js --site <id> --set-property 2569142284 --key "priority" --value "1"
 ```
 
 ---
@@ -335,11 +368,11 @@ node confluence-api-cli.js --set-property 2569142284 --key "priority" --value "1
 페이지 프로퍼티를 삭제합니다.
 
 ```bash
-node confluence-api-cli.js --delete-property <page-id> --key <key>
+node confluence-api-cli.js --site <id> --delete-property <page-id> --key <key>
 ```
 
 ```bash
-node confluence-api-cli.js --delete-property 2569142284 --key "status"
+node confluence-api-cli.js --site <id> --delete-property 2569142284 --key "status"
 ```
 
 ---
@@ -349,11 +382,11 @@ node confluence-api-cli.js --delete-property 2569142284 --key "status"
 페이지의 수정 버전 히스토리를 조회합니다.
 
 ```bash
-node confluence-api-cli.js --list-versions <page-id> [--limit <n>]
+node confluence-api-cli.js --site <id> --list-versions <page-id> [--limit <n>]
 ```
 
 ```bash
-node confluence-api-cli.js --list-versions 2569142284 --limit 10
+node confluence-api-cli.js --site <id> --list-versions 2569142284 --limit 10
 ```
 
 ---
@@ -363,11 +396,11 @@ node confluence-api-cli.js --list-versions 2569142284 --limit 10
 페이지의 푸터 댓글 목록을 조회합니다.
 
 ```bash
-node confluence-api-cli.js --list-comments <page-id> [--limit <n>]
+node confluence-api-cli.js --site <id> --list-comments <page-id> [--limit <n>]
 ```
 
 ```bash
-node confluence-api-cli.js --list-comments 2569142284 --limit 20
+node confluence-api-cli.js --site <id> --list-comments 2569142284 --limit 20
 ```
 
 ---
@@ -377,11 +410,11 @@ node confluence-api-cli.js --list-comments 2569142284 --limit 20
 페이지에 댓글을 추가합니다.
 
 ```bash
-node confluence-api-cli.js --add-comment <page-id> --body <html>
+node confluence-api-cli.js --site <id> --add-comment <page-id> --body <html>
 ```
 
 ```bash
-node confluence-api-cli.js --add-comment 2569142284 --body "<p>확인 부탁드립니다.</p>"
+node confluence-api-cli.js --site <id> --add-comment 2569142284 --body "<p>확인 부탁드립니다.</p>"
 ```
 
 ---
@@ -395,7 +428,7 @@ node confluence-api-cli.js --add-comment 2569142284 --body "<p>확인 부탁드�
 페이지의 첨부파일 목록을 조회합니다.
 
 ```bash
-node confluence-api-cli.js --list-attachments 2569142284
+node confluence-api-cli.js --site <id> --list-attachments 2569142284
 ```
 
 **출력 예시**
@@ -423,7 +456,7 @@ node confluence-api-cli.js --list-attachments 2569142284
 페이지에 파일을 업로드합니다.
 
 ```bash
-node confluence-api-cli.js --upload-attachment <page-id> --file <path>
+node confluence-api-cli.js --site <id> --upload-attachment <page-id> --file <path>
 ```
 
 | 옵션 | 설명 | 필수 |
@@ -431,8 +464,8 @@ node confluence-api-cli.js --upload-attachment <page-id> --file <path>
 | `--file` | 업로드할 파일 경로 (절대 또는 상대 경로) | ✅ |
 
 ```bash
-node confluence-api-cli.js --upload-attachment 2569142284 --file ./report.pdf
-node confluence-api-cli.js --upload-attachment 2569142284 --file /tmp/architecture.png
+node confluence-api-cli.js --site <id> --upload-attachment 2569142284 --file ./report.pdf
+node confluence-api-cli.js --site <id> --upload-attachment 2569142284 --file /tmp/architecture.png
 ```
 
 ---
@@ -442,7 +475,7 @@ node confluence-api-cli.js --upload-attachment 2569142284 --file /tmp/architectu
 첨부파일을 삭제합니다.
 
 ```bash
-node confluence-api-cli.js --delete-attachment att-abc123
+node confluence-api-cli.js --site <id> --delete-attachment att-abc123
 ```
 
 > 첨부파일 ID는 `--list-attachments`로 확인할 수 있습니다.
@@ -454,7 +487,7 @@ node confluence-api-cli.js --delete-attachment att-abc123
 첨부파일을 로컬에 다운로드합니다.
 
 ```bash
-node confluence-api-cli.js --download-attachment <attachment-id> --output <path>
+node confluence-api-cli.js --site <id> --download-attachment <attachment-id> --output <path>
 ```
 
 | 옵션 | 설명 | 필수 |
@@ -462,7 +495,7 @@ node confluence-api-cli.js --download-attachment <attachment-id> --output <path>
 | `--output` | 저장할 파일 경로 | ✅ |
 
 ```bash
-node confluence-api-cli.js --download-attachment att-abc123 --output ./downloaded.pdf
+node confluence-api-cli.js --site <id> --download-attachment att-abc123 --output ./downloaded.pdf
 ```
 
 ---
@@ -473,10 +506,10 @@ node confluence-api-cli.js --download-attachment att-abc123 --output ./downloade
 
 ```bash
 # 결과만 파일로 저장
-node confluence-api-cli.js --get-page 2569142284 2>/dev/null > page.json
+node confluence-api-cli.js --site <id> --get-page 2569142284 2>/dev/null > page.json
 
 # jq와 함께 사용
-node confluence-api-cli.js --list-pages --space-id 790397104 2>/dev/null | jq '.pages[].title'
+node confluence-api-cli.js --site <id> --list-pages --space-id 790397104 2>/dev/null | jq '.pages[].title'
 ```
 
 ---
@@ -495,4 +528,4 @@ node confluence-api-cli.js --list-pages --space-id 790397104 2>/dev/null | jq '.
 ## 요구 사항
 
 - Node.js 20 이상 (native `fetch`, `FormData` 사용)
-- Atlassian Confluence Cloud 계정 및 API 토큰
+- Atlassian Confluence Cloud 계정(API 토큰) 또는 Server/Data Center 계정(비밀번호·PAT)
