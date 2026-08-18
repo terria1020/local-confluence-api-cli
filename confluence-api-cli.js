@@ -3,15 +3,30 @@
 /**
  * confluence-api-cli.js
  *
- * A CLI tool for interacting with Confluence Cloud REST API v2
+ * A CLI tool for interacting with Confluence Cloud REST API v1/v2
  * - Content management: create, read, update, delete pages
  * - Metadata management: labels, properties, versions, comments
  * - Attachment management: upload, list, delete, download
  *
  * Credentials are managed via environment variables:
- *   CONFLUENCE_DOMAIN   - e.g. yourcompany.atlassian.net
- *   CONFLUENCE_EMAIL    - Atlassian account email
- *   CONFLUENCE_API_TOKEN - API token from id.atlassian.com/manage-profile/security/api-tokens
+ *   CONFLUENCE_DOMAIN       - e.g. yourcompany.atlassian.net
+ *   CONFLUENCE_CONTEXT_PATH - e.g. /wiki or /confluence
+ *   CONFLUENCE_BASE_URL     - full base URL override
+ *   CONFLUENCE_EMAIL        - Atlassian account email (cloud basic auth)
+ *   CONFLUENCE_USERNAME     - username (server basic auth)
+ *   CONFLUENCE_API_TOKEN    - API token (cloud basic auth)
+ *   CONFLUENCE_SECRET       - password / PAT / bearer token
+ *   CONFLUENCE_AUTH_TYPE    - basic | bearer (default: basic)
+ *     basic  = CONFLUENCE_EMAIL/CONFLUENCE_USERNAME + CONFLUENCE_API_TOKEN/CONFLUENCE_SECRET
+ *              를 "Authorization: Basic <base64>"로 전송. Cloud API 토큰,
+ *              Server/DC 계정 비밀번호나 PAT를 그대로 쓸 때 선택.
+ *     bearer = CONFLUENCE_SECRET 하나만 "Authorization: Bearer <token>"으로 전송.
+ *              Cloud OAuth access token이나 Server/DC PAT를 Bearer 헤더로 보낼 때 선택.
+ *              이메일/유저명은 필요 없음.
+ *   CONFLUENCE_PLATFORM     - cloud | server (선택, 미지정 시 도메인으로 자동 판별:
+ *                             *.atlassian.net이면 cloud, 그 외는 server)
+ *   CONFLUENCE_API_VERSION  - v1 | v2 (선택, 미지정 시 platform에 따라 자동 결정:
+ *                             cloud는 v2, server는 v1)
  *
  * Usage:
  *   node confluence-api-cli.js --help
@@ -96,24 +111,102 @@ function die(msg) {
 
 function initClient() {
   const domain = process.env.CONFLUENCE_DOMAIN;
-  const email = process.env.CONFLUENCE_EMAIL;
-  const token = process.env.CONFLUENCE_API_TOKEN;
+  const platform = process.env.CONFLUENCE_PLATFORM
+    ? normalizePlatform(process.env.CONFLUENCE_PLATFORM)
+    : inferPlatform(process.env.CONFLUENCE_BASE_URL, domain);
+  const contextPath = normalizeContextPath(
+    process.env.CONFLUENCE_CONTEXT_PATH || (platform === 'cloud' ? '/wiki' : '')
+  );
+  const baseUrl = process.env.CONFLUENCE_BASE_URL || (domain ? `https://${domain}${contextPath}` : null);
+  const username = process.env.CONFLUENCE_USERNAME || process.env.CONFLUENCE_EMAIL;
+  const secret = process.env.CONFLUENCE_SECRET || process.env.CONFLUENCE_API_TOKEN;
+  const defaultAuthType = normalizeAuthType(process.env.CONFLUENCE_AUTH_TYPE || 'basic');
+  const v1AuthType = normalizeAuthType(process.env.CONFLUENCE_V1_AUTH_TYPE || defaultAuthType);
+  const v2AuthType = normalizeAuthType(process.env.CONFLUENCE_V2_AUTH_TYPE || defaultAuthType);
+  const defaultApiVersion = normalizeApiVersion(
+    process.env.CONFLUENCE_API_VERSION || (platform === 'server' ? 'v1' : 'v2')
+  );
 
-  if (!domain) die('CONFLUENCE_DOMAIN environment variable not set.');
-  if (!email) die('CONFLUENCE_EMAIL environment variable not set.');
-  if (!token) die('CONFLUENCE_API_TOKEN environment variable not set.');
+  if (!baseUrl) die('CONFLUENCE_BASE_URL or CONFLUENCE_DOMAIN environment variable not set.');
+  if (!secret) die('CONFLUENCE_SECRET or CONFLUENCE_API_TOKEN environment variable not set.');
+  if (defaultAuthType === 'basic' && !username) {
+    die('CONFLUENCE_USERNAME or CONFLUENCE_EMAIL environment variable not set.');
+  }
 
-  const baseAuth = Buffer.from(`${email}:${token}`).toString('base64');
-  const baseUrl = `https://${domain}/wiki`;
+  const baseAuth = username ? Buffer.from(`${username}:${secret}`).toString('base64') : null;
+  const siteOrigin = new URL(baseUrl).origin;
 
-  logger.debug(`Confluence client initialized for domain: ${domain}`);
+  logger.debug(`Confluence client initialized for platform: ${platform}, baseUrl: ${baseUrl}`);
 
-  async function request(method, endpoint, body = null, isV1 = false) {
-    const apiBase = isV1 ? `${baseUrl}/rest/api` : `${baseUrl}/api/v2`;
+  function authTypeFor(apiVersion) {
+    return apiVersion === 'v1' ? v1AuthType : v2AuthType;
+  }
+
+  function authHeaderFor(apiVersion) {
+    const authType = authTypeFor(apiVersion);
+    if (authType === 'bearer') return `Bearer ${secret}`;
+    if (!baseAuth) die('Basic auth requires CONFLUENCE_USERNAME/CONFLUENCE_EMAIL plus CONFLUENCE_SECRET/CONFLUENCE_API_TOKEN.');
+    return `Basic ${baseAuth}`;
+  }
+
+  function apiBaseFor(apiVersion) {
+    if (platform === 'server') {
+      if (apiVersion && normalizeApiVersion(apiVersion) !== 'v1') {
+        die('Confluence Server/Data Center only supports v1 REST routes in this CLI.');
+      }
+      return `${baseUrl}/rest/api`;
+    }
+    return normalizeApiVersion(apiVersion) === 'v1' ? `${baseUrl}/rest/api` : `${baseUrl}/api/v2`;
+  }
+
+  function isV2(apiVersion = defaultApiVersion) {
+    return platform === 'cloud' && normalizeApiVersion(apiVersion) === 'v2';
+  }
+
+  function webUrlFor(pathname) {
+    if (!pathname) return null;
+    return `${baseUrl}${pathname}`;
+  }
+
+  function pagePath(pageId, apiVersion = defaultApiVersion) {
+    return isV2(apiVersion) ? `/pages/${pageId}` : `/content/${pageId}`;
+  }
+
+  function pagesCollectionPath(apiVersion = defaultApiVersion) {
+    return isV2(apiVersion) ? '/pages' : '/content';
+  }
+
+  function childrenPath(pageId, apiVersion = defaultApiVersion) {
+    return isV2(apiVersion) ? `/pages/${pageId}/children` : `/content/${pageId}/child/page`;
+  }
+
+  function labelsPath(pageId, apiVersion = defaultApiVersion) {
+    return isV2(apiVersion) ? `/pages/${pageId}/labels` : `/content/${pageId}/label`;
+  }
+
+  function propertiesPath(pageId, apiVersion = defaultApiVersion) {
+    return isV2(apiVersion) ? `/pages/${pageId}/properties` : `/content/${pageId}/property`;
+  }
+
+  function versionsPath(pageId, apiVersion = defaultApiVersion) {
+    return isV2(apiVersion) ? `/pages/${pageId}/versions` : `/content/${pageId}/version`;
+  }
+
+  function commentsPath(pageId, apiVersion = defaultApiVersion) {
+    return isV2(apiVersion) ? `/pages/${pageId}/footer-comments` : `/content/${pageId}/child/comment`;
+  }
+
+  function attachmentsPath(pageId, apiVersion = defaultApiVersion) {
+    return isV2(apiVersion) ? `/attachments?pageId=${encodeURIComponent(pageId)}` : `/content/${pageId}/child/attachment`;
+  }
+
+  async function request(method, endpoint, body = null, apiVersion = defaultApiVersion) {
+    const resolvedVersion = normalizeApiVersion(apiVersion);
+    const apiBase = apiBaseFor(resolvedVersion);
     const url = `${apiBase}${endpoint}`;
 
     const headers = {
-      'Authorization': `Basic ${baseAuth}`,
+      'Authorization': authHeaderFor(resolvedVersion),
       'Accept': 'application/json',
     };
 
@@ -154,11 +247,12 @@ function initClient() {
     }
   }
 
-  async function downloadRaw(endpoint) {
-    const url = `${baseUrl}/api/v2${endpoint}`;
+  async function downloadRaw(endpoint, apiVersion = defaultApiVersion) {
+    const resolvedVersion = normalizeApiVersion(apiVersion);
+    const url = `${apiBaseFor(resolvedVersion)}${endpoint}`;
     const res = await fetch(url, {
       method: 'GET',
-      headers: { 'Authorization': `Basic ${baseAuth}` },
+      headers: { 'Authorization': authHeaderFor(resolvedVersion) },
       redirect: 'follow',
     });
 
@@ -169,10 +263,71 @@ function initClient() {
     return res;
   }
 
-  return { request, downloadRaw, baseUrl };
+  return {
+    request,
+    downloadRaw,
+    baseUrl,
+    siteOrigin,
+    platform,
+    isV2,
+    apiBaseFor,
+    authHeaderFor,
+    webUrlFor,
+    pagePath,
+    pagesCollectionPath,
+    childrenPath,
+    labelsPath,
+    propertiesPath,
+    versionsPath,
+    commentsPath,
+    attachmentsPath,
+    defaultApiVersion,
+  };
 }
 
 // ─── Helper ───────────────────────────────────────────────────────────────────
+
+function normalizeAuthType(value) {
+  const normalized = String(value || '').trim().toLowerCase();
+  if (!normalized) return 'basic';
+  if (normalized === 'basic' || normalized === 'bearer') return normalized;
+  die(`CONFLUENCE_AUTH_TYPE must be either "basic" or "bearer" (got "${value}")`);
+}
+
+function inferPlatform(baseUrlOverride, domain) {
+  let host = '';
+  try {
+    host = new URL(baseUrlOverride || `https://${domain || ''}`).hostname;
+  } catch (_) {
+    host = domain || '';
+  }
+  const platform = /(^|\.)atlassian\.net$/i.test(host) ? 'cloud' : 'server';
+  logger.debug(`CONFLUENCE_PLATFORM not set, inferred "${platform}" from host: ${host}`);
+  return platform;
+}
+
+function normalizePlatform(value) {
+  const normalized = String(value || '').trim().toLowerCase();
+  if (!normalized || normalized === 'cloud' || normalized === 'on-demand' || normalized === 'ondemand') return 'cloud';
+  if (normalized === 'server' || normalized === 'dc' || normalized === 'datacenter' || normalized === 'data-center' || normalized === 'onprem' || normalized === 'on-prem') {
+    return 'server';
+  }
+  die(`CONFLUENCE_PLATFORM must be either "cloud" or "server" (got "${value}")`);
+}
+
+function normalizeContextPath(value) {
+  const normalized = String(value || '').trim();
+  if (!normalized || normalized === '/') return '';
+  const withLeadingSlash = normalized.startsWith('/') ? normalized : `/${normalized}`;
+  return withLeadingSlash.replace(/\/+$/, '');
+}
+
+function normalizeApiVersion(value) {
+  const normalized = String(value || '').trim().toLowerCase();
+  if (!normalized) return 'v2';
+  if (normalized === 'v1' || normalized === 'v2') return normalized;
+  die(`CONFLUENCE_API_VERSION must be either "v1" or "v2" (got "${value}")`);
+}
 
 function parseJsonOption(jsonString, optionName) {
   if (!jsonString) die(`--${optionName} requires a JSON string`);
@@ -200,31 +355,36 @@ function buildQueryString(params) {
 
 async function getPage(client, pageId) {
   logger.info(`Fetching page: ${pageId}`);
-  const data = await client.request('GET', `/pages/${pageId}?body-format=storage`);
+  const endpoint = client.isV2()
+    ? `${client.pagePath(pageId)}?body-format=storage`
+    : `${client.pagePath(pageId)}?expand=body.storage,version,space,ancestors`;
+  const data = await client.request('GET', endpoint);
   console.log(JSON.stringify({
     id: data.id,
     title: data.title,
     status: data.status,
-    spaceId: data.spaceId,
-    parentId: data.parentId,
+    spaceId: data.spaceId || data.space?.key || null,
+    parentId: data.parentId || data.ancestors?.[data.ancestors.length - 1]?.id || null,
     version: data.version?.number,
     createdAt: data.createdAt,
     authorId: data.ownerId,
     body: data.body?.storage?.value || '',
-    webUrl: data._links?.webui ? `https://${process.env.CONFLUENCE_DOMAIN}/wiki${data._links.webui}` : null,
+    webUrl: client.webUrlFor(data._links?.webui || data._links?.base || null),
   }, null, 2));
 }
 
 async function listPages(client, spaceId, title, limit) {
   logger.info('Listing pages');
-  const qs = buildQueryString({ 'space-id': spaceId, title, limit });
-  const data = await client.request('GET', `/pages${qs}`);
+  const qs = client.isV2()
+    ? buildQueryString({ 'space-id': spaceId, title, limit })
+    : buildQueryString({ type: 'page', spaceKey: spaceId, title, limit });
+  const data = await client.request('GET', `${client.pagesCollectionPath()}${qs}`);
   const results = (data.results || []).map(p => ({
     id: p.id,
     title: p.title,
     status: p.status,
-    spaceId: p.spaceId,
-    parentId: p.parentId,
+    spaceId: p.spaceId || p.space?.key || null,
+    parentId: p.parentId || p.ancestors?.[p.ancestors.length - 1]?.id || null,
     version: p.version?.number,
   }));
   console.log(JSON.stringify({ count: results.length, pages: results }, null, 2));
@@ -236,27 +396,52 @@ async function createPage(client, title, spaceId, body, parentId) {
 
   logger.info(`Creating page: "${title}" in space ${spaceId}`);
 
+  if (client.isV2()) {
+    const payload = {
+      spaceId,
+      status: 'current',
+      title,
+      body: {
+        representation: 'storage',
+        value: body || '',
+      },
+    };
+    if (parentId) payload.parentId = parentId;
+    const data = await client.request('POST', '/pages', payload);
+    console.log(JSON.stringify({
+      id: data.id,
+      title: data.title,
+      status: data.status,
+      spaceId: data.spaceId,
+      parentId: data.parentId,
+      version: data.version?.number,
+      webUrl: client.webUrlFor(data._links?.webui || data._links?.base || null),
+    }, null, 2));
+    return;
+  }
+
   const payload = {
-    spaceId,
-    status: 'current',
+    type: 'page',
     title,
+    space: { key: spaceId },
     body: {
-      representation: 'storage',
-      value: body || '',
+      storage: {
+        representation: 'storage',
+        value: body || '',
+      },
     },
   };
+  if (parentId) payload.ancestors = [{ id: parentId }];
 
-  if (parentId) payload.parentId = parentId;
-
-  const data = await client.request('POST', '/pages', payload);
+  const data = await client.request('POST', '/content', payload);
   console.log(JSON.stringify({
     id: data.id,
     title: data.title,
     status: data.status,
-    spaceId: data.spaceId,
-    parentId: data.parentId,
+    spaceId: data.spaceId || data.space?.key || null,
+    parentId: data.parentId || data.ancestors?.[data.ancestors.length - 1]?.id || null,
     version: data.version?.number,
-    webUrl: data._links?.webui ? `https://${process.env.CONFLUENCE_DOMAIN}/wiki${data._links.webui}` : null,
+    webUrl: client.webUrlFor(data._links?.webui || data._links?.base || null),
   }, null, 2));
 }
 
@@ -264,22 +449,36 @@ async function updatePage(client, pageId, title, body) {
   if (!title && body === undefined) die('--update-page requires at least --title or --body');
 
   logger.info(`Fetching current version for page: ${pageId}`);
-  const current = await client.request('GET', `/pages/${pageId}?body-format=storage`);
+  const current = await client.request('GET', client.isV2()
+    ? `${client.pagePath(pageId)}?body-format=storage`
+    : `${client.pagePath(pageId)}?expand=body.storage,version,space,ancestors`);
   const currentVersion = current.version?.number || 1;
 
-  const payload = {
-    id: pageId,
-    status: 'current',
-    title: title || current.title,
-    version: { number: currentVersion + 1 },
-    body: {
-      representation: 'storage',
-      value: body !== undefined ? body : (current.body?.storage?.value || ''),
-    },
-  };
-
   logger.info(`Updating page: ${pageId} (version ${currentVersion} → ${currentVersion + 1})`);
-  const data = await client.request('PUT', `/pages/${pageId}`, payload);
+  const data = client.isV2()
+    ? await client.request('PUT', client.pagePath(pageId), {
+        id: pageId,
+        status: 'current',
+        title: title || current.title,
+        version: { number: currentVersion + 1 },
+        body: {
+          representation: 'storage',
+          value: body !== undefined ? body : (current.body?.storage?.value || ''),
+        },
+      })
+    : await client.request('PUT', client.pagePath(pageId), {
+        id: pageId,
+        type: 'page',
+        title: title || current.title,
+        version: { number: currentVersion + 1 },
+        space: { key: current.spaceId || current.space?.key },
+        body: {
+          storage: {
+            representation: 'storage',
+            value: body !== undefined ? body : (current.body?.storage?.value || ''),
+          },
+        },
+      });
   console.log(JSON.stringify({
     id: data.id,
     title: data.title,
@@ -290,19 +489,19 @@ async function updatePage(client, pageId, title, body) {
 
 async function deletePage(client, pageId) {
   logger.info(`Deleting page: ${pageId}`);
-  await client.request('DELETE', `/pages/${pageId}`);
+  await client.request('DELETE', client.pagePath(pageId));
   console.log(JSON.stringify({ success: true, pageId, message: 'Page moved to trash' }, null, 2));
 }
 
 async function getChildren(client, pageId, limit) {
   logger.info(`Fetching children of page: ${pageId}`);
   const qs = buildQueryString({ limit });
-  const data = await client.request('GET', `/pages/${pageId}/children${qs}`);
+  const data = await client.request('GET', `${client.childrenPath(pageId)}${qs}`);
   const results = (data.results || []).map(p => ({
     id: p.id,
     title: p.title,
     status: p.status,
-    spaceId: p.spaceId,
+    spaceId: p.spaceId || p.space?.key || null,
     version: p.version?.number,
   }));
   console.log(JSON.stringify({ parentId: pageId, count: results.length, children: results }, null, 2));
@@ -312,7 +511,7 @@ async function search(client, cql, limit) {
   if (!cql) die('--cql is required for --search');
   logger.info(`Searching with CQL: ${cql}`);
   const qs = buildQueryString({ cql, limit });
-  const data = await client.request('GET', `/search${qs}`, null, true);
+  const data = await client.request('GET', `/search${qs}`, null, 'v1');
   const results = (data.results || []).map(r => ({
     id: r.content?.id,
     type: r.content?.type,
@@ -329,7 +528,7 @@ async function search(client, cql, limit) {
 
 async function listLabels(client, pageId) {
   logger.info(`Fetching labels for page: ${pageId}`);
-  const data = await client.request('GET', `/pages/${pageId}/labels`);
+  const data = await client.request('GET', client.labelsPath(pageId));
   const labels = (data.results || []).map(l => ({
     id: l.id,
     name: l.name,
@@ -352,7 +551,7 @@ async function addLabels(client, pageId, labelsInput) {
 
   logger.info(`Adding labels to page ${pageId}: ${names.join(', ')}`);
   const payload = names.map(name => ({ name, prefix: 'global' }));
-  const data = await client.request('POST', `/pages/${pageId}/labels`, payload);
+  const data = await client.request('POST', client.labelsPath(pageId), payload);
   const labels = (data.results || []).map(l => ({ id: l.id, name: l.name, prefix: l.prefix }));
   console.log(JSON.stringify({ pageId, added: names, labels }, null, 2));
 }
@@ -361,11 +560,16 @@ async function removeLabel(client, pageId, labelName) {
   if (!labelName) die('--label is required for --remove-label');
   logger.info(`Removing label "${labelName}" from page ${pageId}`);
 
-  const listData = await client.request('GET', `/pages/${pageId}/labels`);
+  const listData = await client.request('GET', client.labelsPath(pageId));
   const found = (listData.results || []).find(l => l.name === labelName);
   if (!found) die(`Label "${labelName}" not found on page ${pageId}`);
 
-  await client.request('DELETE', `/pages/${pageId}/labels/${found.id}`);
+  if (client.isV2()) {
+    await client.request('DELETE', `${client.labelsPath(pageId)}/${found.id}`);
+  } else {
+    const qs = buildQueryString({ name: labelName, prefix: found.prefix || 'global' });
+    await client.request('DELETE', `${client.labelsPath(pageId)}${qs}`);
+  }
   console.log(JSON.stringify({ success: true, pageId, removedLabel: labelName }, null, 2));
 }
 
@@ -373,7 +577,7 @@ async function removeLabel(client, pageId, labelName) {
 
 async function listProperties(client, pageId) {
   logger.info(`Fetching properties for page: ${pageId}`);
-  const data = await client.request('GET', `/pages/${pageId}/properties`);
+  const data = await client.request('GET', client.propertiesPath(pageId));
   const props = (data.results || []).map(p => ({
     id: p.id,
     key: p.key,
@@ -397,19 +601,19 @@ async function setProperty(client, pageId, key, valueInput) {
   // Check if property already exists to decide POST vs PUT
   let existing = null;
   try {
-    existing = await client.request('GET', `/pages/${pageId}/properties/${key}`);
+    existing = await client.request('GET', `${client.propertiesPath(pageId)}/${key}`);
   } catch (_) {}
 
   if (existing) {
     const currentVersion = existing.version?.number || 1;
     logger.info(`Updating property "${key}" on page ${pageId} (version ${currentVersion} → ${currentVersion + 1})`);
     const payload = { key, value, version: { number: currentVersion + 1 } };
-    const data = await client.request('PUT', `/pages/${pageId}/properties/${key}`, payload);
+    const data = await client.request('PUT', `${client.propertiesPath(pageId)}/${key}`, payload);
     console.log(JSON.stringify({ pageId, key: data.key, value: data.value, version: data.version?.number }, null, 2));
   } else {
     logger.info(`Creating property "${key}" on page ${pageId}`);
     const payload = { key, value };
-    const data = await client.request('POST', `/pages/${pageId}/properties`, payload);
+    const data = await client.request('POST', client.propertiesPath(pageId), payload);
     console.log(JSON.stringify({ pageId, key: data.key, value: data.value, version: data.version?.number }, null, 2));
   }
 }
@@ -417,7 +621,7 @@ async function setProperty(client, pageId, key, valueInput) {
 async function deleteProperty(client, pageId, key) {
   if (!key) die('--key is required for --delete-property');
   logger.info(`Deleting property "${key}" from page ${pageId}`);
-  await client.request('DELETE', `/pages/${pageId}/properties/${key}`);
+  await client.request('DELETE', `${client.propertiesPath(pageId)}/${key}`);
   console.log(JSON.stringify({ success: true, pageId, deletedKey: key }, null, 2));
 }
 
@@ -426,7 +630,7 @@ async function deleteProperty(client, pageId, key) {
 async function listVersions(client, pageId, limit) {
   logger.info(`Fetching versions for page: ${pageId}`);
   const qs = buildQueryString({ limit });
-  const data = await client.request('GET', `/pages/${pageId}/versions${qs}`);
+  const data = await client.request('GET', `${client.versionsPath(pageId)}${qs}`);
   const versions = (data.results || []).map(v => ({
     number: v.number,
     authorId: v.authorId,
@@ -442,7 +646,7 @@ async function listVersions(client, pageId, limit) {
 async function listComments(client, pageId, limit) {
   logger.info(`Fetching footer comments for page: ${pageId}`);
   const qs = buildQueryString({ limit });
-  const data = await client.request('GET', `/pages/${pageId}/footer-comments${qs}`);
+  const data = await client.request('GET', `${client.commentsPath(pageId)}${qs}`);
   const comments = (data.results || []).map(c => ({
     id: c.id,
     status: c.status,
@@ -456,14 +660,25 @@ async function listComments(client, pageId, limit) {
 async function addComment(client, pageId, body) {
   if (!body) die('--body is required for --add-comment');
   logger.info(`Adding comment to page: ${pageId}`);
-  const payload = {
-    pageId,
-    body: {
-      representation: 'storage',
-      value: body,
-    },
-  };
-  const data = await client.request('POST', '/footer-comments', payload);
+  const payload = client.isV2()
+    ? {
+        pageId,
+        body: {
+          representation: 'storage',
+          value: body,
+        },
+      }
+    : {
+        type: 'comment',
+        container: { id: pageId, type: 'page' },
+        body: {
+          storage: {
+            representation: 'storage',
+            value: body,
+          },
+        },
+      };
+  const data = await client.request('POST', client.commentsPath(pageId), payload);
   console.log(JSON.stringify({
     id: data.id,
     pageId: data.pageId,
@@ -477,8 +692,10 @@ async function addComment(client, pageId, body) {
 
 async function listAttachments(client, pageId) {
   logger.info(`Fetching attachments for page: ${pageId}`);
-  const qs = buildQueryString({ 'pageId': pageId });
-  const data = await client.request('GET', `/attachments${qs}`);
+  const endpoint = client.isV2()
+    ? client.attachmentsPath(pageId)
+    : client.attachmentsPath(pageId);
+  const data = await client.request('GET', endpoint);
   const attachments = (data.results || []).map(a => ({
     id: a.id,
     title: a.title,
@@ -506,17 +723,12 @@ async function uploadAttachment(client, pageId, filePath) {
   formData.append('comment', `Uploaded via ${APP_NAME}`);
   formData.append('minorEdit', 'true');
 
-  const domain = process.env.CONFLUENCE_DOMAIN;
-  const email = process.env.CONFLUENCE_EMAIL;
-  const token = process.env.CONFLUENCE_API_TOKEN;
-  const baseAuth = Buffer.from(`${email}:${token}`).toString('base64');
-
   // v2 API는 attachment POST 미지원 → v1 endpoint 사용
-  const url = `https://${domain}/wiki/rest/api/content/${pageId}/child/attachment`;
+  const url = `${client.apiBaseFor('v1')}/content/${pageId}/child/attachment`;
   const res = await fetch(url, {
     method: 'POST',
     headers: {
-      'Authorization': `Basic ${baseAuth}`,
+      'Authorization': client.authHeaderFor('v1'),
       'Accept': 'application/json',
       'X-Atlassian-Token': 'no-check',
     },
@@ -555,11 +767,11 @@ async function downloadAttachment(client, attachmentId, outputPath) {
   if (!outputPath) die('--output is required for --download-attachment');
 
   logger.info(`Fetching attachment info: ${attachmentId}`);
-  const info = await client.request('GET', `/attachments/${attachmentId}`);
+  const info = await client.request('GET', `/attachments/${attachmentId}`, null, 'v1');
   const filename = info.title || attachmentId;
 
   logger.info(`Downloading attachment: ${filename}`);
-  const res = await client.downloadRaw(`/attachments/${attachmentId}/download`);
+  const res = await client.downloadRaw(`/attachments/${attachmentId}/download`, 'v1');
 
   const resolvedOutput = path.resolve(outputPath);
   const buffer = Buffer.from(await res.arrayBuffer());
@@ -685,15 +897,27 @@ Usage: confluence-api-cli [command] [options]
 
 ─── Environment ──────────────────────────────────────────────────────────────
 
-  CONFLUENCE_DOMAIN       Atlassian 도메인 (예: yourcompany.atlassian.net)
-  CONFLUENCE_EMAIL        Atlassian 계정 이메일
-  CONFLUENCE_API_TOKEN    API 토큰 (https://id.atlassian.com/manage-profile/security/api-tokens)
+  CONFLUENCE_DOMAIN       Atlassian 도메인
+  CONFLUENCE_CONTEXT_PATH /wiki, /confluence 등 컨텍스트 경로
+  CONFLUENCE_BASE_URL     전체 base URL 오버라이드
+  CONFLUENCE_EMAIL        Cloud basic auth 계정 이메일
+  CONFLUENCE_USERNAME     Server basic auth 사용자명
+  CONFLUENCE_API_TOKEN    Cloud API 토큰
+  CONFLUENCE_SECRET       Server PAT / 비밀번호 / bearer 토큰
+  CONFLUENCE_AUTH_TYPE    basic | bearer (기본: basic)
+                          basic  = 이메일/유저명 + API 토큰(PAT)을 Basic 인증으로 전송
+                          bearer = CONFLUENCE_SECRET(OAuth 액세스 토큰, Server PAT 등)만
+                                   Bearer 헤더로 전송 — 이메일/유저명 불필요
+  CONFLUENCE_PLATFORM     cloud | server (선택 — 미지정 시 도메인으로 자동 판별:
+                          *.atlassian.net → cloud, 그 외 → server)
+  CONFLUENCE_API_VERSION  v1 | v2 (선택 — 미지정 시 platform 기준 자동 결정:
+                          cloud → v2, server → v1)
   LOG_LEVEL               로그 레벨 (기본: info)
 
 ─── Setup ────────────────────────────────────────────────────────────────────
 
   1. .env.example 을 .env 로 복사
-  2. CONFLUENCE_DOMAIN, CONFLUENCE_EMAIL, CONFLUENCE_API_TOKEN 설정
+  2. base URL과 auth 타입에 맞는 변수 설정 (platform/API 버전은 보통 자동 판별됨)
   3. CLI 실행
 `);
 }
